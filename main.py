@@ -21,7 +21,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 GROUP_ID = int(os.getenv("GROUP_ID", "0"))
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
-REWARD_IMAGE_URL = os.getenv("REWARD_IMAGE_URL", "https://picsum.photos/1200/800")
+REWARD_IMAGE_URL = os.getenv("REWARD_IMAGE_URL", "https://postimg.cc/3W2rzWCs")
 REWARD_REQUIRED_JOINS = int(os.getenv("REWARD_REQUIRED_JOINS", "6"))
 DEFAULT_REWARD_TEXT = f"🎁 Récompense disponible !\n\nClique sur “Je partage” pour recevoir ton lien personnalisé. Dès que {REWARD_REQUIRED_JOINS} personnes rejoignent avec ton lien, tu reçois le lien ici. Tu peux également suivre ta progression."
 
