@@ -41,7 +41,7 @@ DEFAULT_REWARD_TEXT = (
     "🎁 Récompense disponible !\n\n"
     "Clique sur “Recevoir mon lien” pour obtenir ton lien personnalisé.\n\n"
     f"Quand {REWARD_REQUIRED_JOINS} personnes rejoignent avec TON lien, "
-    "tu reçois le lien ici.\n\n"
+    "tu reçois le lien gofile ici.\n\n"
     "Tu peux également suivre ta progression."
 )
 
