@@ -453,12 +453,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Règle prioritaire, même si le groupe est ON ou OFF :
     # média interdit pour utilisateurs normaux.
-    # Si média envoyé dans les 2 minutes après arrivée/rejoin => mute 1 jour.
+    # Si média envoyé dans les 2 minutes après arrivée/rejoin => ban direct.
+    # Après 2 minutes => suppression seulement.
     if has_media(msg):
         await delete_safely(context, msg.chat_id, msg.message_id)
 
         if int(time.time()) - int(joined_at) <= 120:
-            await mute_user(context, msg.chat_id, user.id, 1)
+            await ban_user(context, msg.chat_id, user.id)
 
         return
 
@@ -474,6 +475,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text and await check_forbidden(msg.chat_id, text):
         await delete_safely(context, msg.chat_id, msg.message_id)
         await punish_forbidden_word(context, msg.chat_id, user.id)
+        return
+
+    # Message texte envoyé dans les 2 minutes après arrivée/rejoin => mute 1 jour.
+    # Pas de message public.
+    if text and int(time.time()) - int(joined_at) <= 120:
+        await delete_safely(context, msg.chat_id, msg.message_id)
+        await mute_user(context, msg.chat_id, user.id, 1)
         return
 
     row = await DB.fetchrow("SELECT messages_open FROM settings WHERE chat_id=$1", msg.chat_id)
