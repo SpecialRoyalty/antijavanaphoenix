@@ -449,16 +449,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Enregistre un fallback d'arrivée au premier message vu.
     # Ça rend la règle média 2 minutes beaucoup plus fiable si Telegram rate le join.
-    await get_or_create_join_time(msg.chat_id, user.id)
+    joined_at = await get_or_create_join_time(msg.chat_id, user.id)
 
-    # Règle prioritaire, même si le groupe est OFF :
+    # Règle prioritaire, même si le groupe est ON ou OFF :
+    # média interdit pour utilisateurs normaux.
+    # Si média envoyé dans les 2 minutes après arrivée/rejoin => mute 1 jour.
+    if has_media(msg):
+        await delete_safely(context, msg.chat_id, msg.message_id)
+
+        if int(time.time()) - int(joined_at) <= 120:
+            await mute_user(context, msg.chat_id, user.id, 1)
+
+        return
+
+    # Règle prioritaire, même si le groupe est ON ou OFF :
     # lien ou @ = ban direct, sans message public.
     if text and (URL_RE.search(text) or AT_RE.search(text)):
         await delete_safely(context, msg.chat_id, msg.message_id)
         await ban_user(context, msg.chat_id, user.id)
         return
 
-    # Mot interdit, même si le groupe est OFF :
+    # Mot interdit, même si le groupe est ON ou OFF :
     # 1ère fois mute 1 jour, récidive mute 30 jours.
     if text and await check_forbidden(msg.chat_id, text):
         await delete_safely(context, msg.chat_id, msg.message_id)
@@ -469,18 +480,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     messages_open = bool(row["messages_open"]) if row else True
 
     # Si OFF, tout message utilisateur normal est supprimé,
-    # mais les règles lien/@/mots interdits ont déjà été appliquées avant.
+    # mais les règles média/lien/@/mots interdits ont déjà été appliquées avant.
     if not messages_open:
         await delete_safely(context, msg.chat_id, msg.message_id)
-        return
-
-    if has_media(msg):
-        await delete_safely(context, msg.chat_id, msg.message_id)
-
-        joined_at = await get_or_create_join_time(msg.chat_id, user.id)
-        if int(time.time()) - int(joined_at) <= 120:
-            await mute_user(context, msg.chat_id, user.id, 1)
-
         return
 
     if not text:
