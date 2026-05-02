@@ -41,7 +41,7 @@ DEFAULT_REWARD_TEXT = (
     "🎁 Récompense disponible !\n\n"
     "Clique sur “Recevoir mon lien” pour obtenir ton lien personnalisé.\n\n"
     f"Quand {REWARD_REQUIRED_JOINS} personnes rejoignent avec TON lien, "
-    "tu reçois le lien gofile ici.\n\n"
+    "tu reçois le lien ici.\n\n"
     "Tu peux également suivre ta progression."
 )
 
@@ -308,7 +308,23 @@ async def mute_user(context, chat_id: int, user_id: int, days: int):
     )
 
 
-async def punish(context, chat_id: int, user_id: int) -> int:
+async def ban_user(context, chat_id: int, user_id: int):
+    """
+    Ban direct, sans message public.
+    """
+    try:
+        await context.bot.ban_chat_member(chat_id, user_id)
+    except Exception as e:
+        log.warning("ban failed for %s: %s", user_id, e)
+
+
+async def punish_forbidden_word(context, chat_id: int, user_id: int) -> int:
+    """
+    Mot interdit :
+    - 1ère fois : mute 1 jour
+    - 2ème fois et suivantes : mute 30 jours
+    L'utilisateur peut lire mais ne peut plus envoyer.
+    """
     count = await DB.fetchval("""
         INSERT INTO violations(chat_id, user_id, count)
         VALUES($1, $2, 1)
@@ -317,7 +333,7 @@ async def punish(context, chat_id: int, user_id: int) -> int:
         RETURNING count
     """, chat_id, user_id)
 
-    days = 7 if count and count >= 2 else 1
+    days = 30 if count and count >= 2 else 1
     await mute_user(context, chat_id, user_id, days)
     return days
 
@@ -359,6 +375,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await save_user(user, started_private=False)
 
+    # Service messages : entrée/sortie, ajout bot.
     if msg.new_chat_members or msg.left_chat_member:
         for u in msg.new_chat_members or []:
             await save_user(u, started_private=False)
@@ -369,15 +386,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 DO UPDATE SET joined_at=$3
             """, msg.chat_id, u.id, int(time.time()))
 
+            # Si un non-admin ajoute un bot, ban direct de l'utilisateur + du bot ajouté.
+            if getattr(u, "is_bot", False) and not await is_admin(update, context, user.id, msg.chat_id):
+                await ban_user(context, msg.chat_id, user.id)
+                await ban_user(context, msg.chat_id, u.id)
+
+        await delete_safely(context, msg.chat_id, msg.message_id)
+        return
+
+    # Piège permissions ouvertes :
+    # si un non-admin change nom/photo/supprime photo du groupe => ban direct.
+    if msg.new_chat_title or msg.new_chat_photo or msg.delete_chat_photo:
+        if not await is_admin(update, context, user.id, msg.chat_id):
+            await ban_user(context, msg.chat_id, user.id)
         await delete_safely(context, msg.chat_id, msg.message_id)
         return
 
     if await is_admin(update, context, user.id, msg.chat_id):
         return
 
+    text = msg.text or msg.caption or ""
+
+    # Règle prioritaire, même si le groupe est OFF :
+    # lien ou @ = ban direct, sans message public.
+    if text and (URL_RE.search(text) or AT_RE.search(text)):
+        await delete_safely(context, msg.chat_id, msg.message_id)
+        await ban_user(context, msg.chat_id, user.id)
+        return
+
+    # Mot interdit, même si le groupe est OFF :
+    # 1ère fois mute 1 jour, récidive mute 30 jours.
+    if text and await check_forbidden(msg.chat_id, text):
+        await delete_safely(context, msg.chat_id, msg.message_id)
+        await punish_forbidden_word(context, msg.chat_id, user.id)
+        return
+
     row = await DB.fetchrow("SELECT messages_open FROM settings WHERE chat_id=$1", msg.chat_id)
     messages_open = bool(row["messages_open"]) if row else True
 
+    # Si OFF, tout message utilisateur normal est supprimé,
+    # mais les règles lien/@/mots interdits ont déjà été appliquées avant.
     if not messages_open:
         await delete_safely(context, msg.chat_id, msg.message_id)
         return
@@ -396,24 +444,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    text = msg.text or msg.caption or ""
-
     if not text:
         await delete_safely(context, msg.chat_id, msg.message_id)
         return
-
-    if await check_forbidden(msg.chat_id, text) or URL_RE.search(text) or AT_RE.search(text):
-        await delete_safely(context, msg.chat_id, msg.message_id)
-        days = await punish(context, msg.chat_id, user.id)
-        warn = await context.bot.send_message(
-            msg.chat_id,
-            f"Utilisateur muté {days} jour(s) pour contenu interdit.",
-        )
-        context.job_queue.run_once(
-            delete_later,
-            20,
-            data={"chat_id": msg.chat_id, "message_id": warn.message_id},
-        )
 
 
 async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -521,7 +554,8 @@ async def list_active_rewards(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         share_url = f"https://t.me/share/url?url={quote_plus(invite)}&text={quote_plus(share_text)}"
 
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📤 Envoyer mon lien en cours", url=share_url)]
+            [InlineKeyboardButton("📤 Envoyer mon lien en cours", url=share_url)],
+            [InlineKeyboardButton("🔄 Rafraîchir progression", callback_data=f"refresh:{active_challenge['campaign_id']}")],
         ])
 
         await context.bot.send_message(
@@ -599,7 +633,8 @@ async def send_personal_share(user_id: int, context: ContextTypes.DEFAULT_TYPE, 
         share_url = f"https://t.me/share/url?url={quote_plus(invite)}&text={quote_plus(share_text)}"
 
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📤 Envoyer mon lien en cours", url=share_url)]
+            [InlineKeyboardButton("📤 Envoyer mon lien en cours", url=share_url)],
+            [InlineKeyboardButton("🔄 Rafraîchir progression", callback_data=f"refresh:{active_challenge['campaign_id']}")],
         ])
 
         await context.bot.send_message(
@@ -647,7 +682,8 @@ async def send_personal_share(user_id: int, context: ContextTypes.DEFAULT_TYPE, 
     share_url = f"https://t.me/share/url?url={quote_plus(invite)}&text={quote_plus(share_text)}"
 
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📤 Envoyer le lien", url=share_url)]
+        [InlineKeyboardButton("📤 Envoyer le lien", url=share_url)],
+        [InlineKeyboardButton("🔄 Rafraîchir progression", callback_data=f"refresh:{campaign_id}")],
     ])
 
     await context.bot.send_message(
@@ -722,6 +758,16 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             start_link = f"https://t.me/{BOT_USERNAME}?start=reward_{campaign_id}" if BOT_USERNAME else "le bot en privé"
             await q.answer(f"Ouvre d’abord le bot en privé : {start_link}", show_alert=True)
 
+        return
+
+    if q.data.startswith("refresh:"):
+        campaign_id = int(q.data.split(":", 1)[1])
+        try:
+            await send_personal_share(q.from_user.id, context, campaign_id)
+            await q.answer("Progression rafraîchie.", show_alert=False)
+        except Exception as e:
+            log.warning("refresh failed: %s", e)
+            await q.answer("Impossible de rafraîchir maintenant.", show_alert=True)
         return
 
     if not await ensure_admin(update, context):
