@@ -139,8 +139,11 @@ async def init_db():
             chat_id BIGINT NOT NULL,
             user_id BIGINT NOT NULL,
             joined_at BIGINT NOT NULL,
+            seen_at BIGINT DEFAULT 0,
             PRIMARY KEY(chat_id, user_id)
         );
+
+        ALTER TABLE joins ADD COLUMN IF NOT EXISTS seen_at BIGINT DEFAULT 0;
 
         CREATE TABLE IF NOT EXISTS violations (
             chat_id BIGINT NOT NULL,
@@ -366,6 +369,43 @@ async def check_forbidden(chat_id: int, text: str) -> str | None:
     return None
 
 
+async def get_or_create_join_time(chat_id: int, user_id: int) -> int:
+    """
+    Telegram peut parfois rater/retarder l'événement de join.
+    Pour éviter le bypass :
+    - si joined_at existe, on l'utilise.
+    - sinon, on enregistre le premier message vu comme seen_at/joined_at fallback.
+    """
+    now = int(time.time())
+    row = await DB.fetchrow(
+        "SELECT joined_at, seen_at FROM joins WHERE chat_id=$1 AND user_id=$2",
+        chat_id,
+        user_id,
+    )
+
+    if row:
+        joined_at = int(row["joined_at"] or 0)
+        seen_at = int(row["seen_at"] or 0)
+
+        if not seen_at:
+            await DB.execute(
+                "UPDATE joins SET seen_at=$3 WHERE chat_id=$1 AND user_id=$2",
+                chat_id,
+                user_id,
+                now,
+            )
+
+        return joined_at or seen_at or now
+
+    await DB.execute("""
+        INSERT INTO joins(chat_id, user_id, joined_at, seen_at)
+        VALUES($1, $2, $3, $3)
+        ON CONFLICT(chat_id, user_id) DO NOTHING
+    """, chat_id, user_id, now)
+
+    return now
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     user = update.effective_user
@@ -380,10 +420,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for u in msg.new_chat_members or []:
             await save_user(u, started_private=False)
             await DB.execute("""
-                INSERT INTO joins(chat_id, user_id, joined_at)
-                VALUES($1, $2, $3)
+                INSERT INTO joins(chat_id, user_id, joined_at, seen_at)
+                VALUES($1, $2, $3, 0)
                 ON CONFLICT(chat_id, user_id)
-                DO UPDATE SET joined_at=$3
+                DO UPDATE SET joined_at=$3, seen_at=0
             """, msg.chat_id, u.id, int(time.time()))
 
             # Si un non-admin ajoute un bot, ban direct de l'utilisateur + du bot ajouté.
@@ -406,6 +446,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = msg.text or msg.caption or ""
+
+    # Enregistre un fallback d'arrivée au premier message vu.
+    # Ça rend la règle média 2 minutes beaucoup plus fiable si Telegram rate le join.
+    await get_or_create_join_time(msg.chat_id, user.id)
 
     # Règle prioritaire, même si le groupe est OFF :
     # lien ou @ = ban direct, sans message public.
@@ -433,13 +477,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if has_media(msg):
         await delete_safely(context, msg.chat_id, msg.message_id)
 
-        joined_at = await DB.fetchval(
-            "SELECT joined_at FROM joins WHERE chat_id=$1 AND user_id=$2",
-            msg.chat_id,
-            user.id,
-        )
-
-        if joined_at and int(time.time()) - int(joined_at) <= 120:
+        joined_at = await get_or_create_join_time(msg.chat_id, user.id)
+        if int(time.time()) - int(joined_at) <= 120:
             await mute_user(context, msg.chat_id, user.id, 1)
 
         return
@@ -464,10 +503,10 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await save_user(cmu.new_chat_member.user, started_private=False)
 
         await DB.execute("""
-            INSERT INTO joins(chat_id, user_id, joined_at)
-            VALUES($1, $2, $3)
+            INSERT INTO joins(chat_id, user_id, joined_at, seen_at)
+            VALUES($1, $2, $3, 0)
             ON CONFLICT(chat_id, user_id)
-            DO UPDATE SET joined_at=$3
+            DO UPDATE SET joined_at=$3, seen_at=0
         """, GROUP_ID, user_id, int(time.time()))
 
         inv = cmu.invite_link.invite_link if cmu.invite_link else None
