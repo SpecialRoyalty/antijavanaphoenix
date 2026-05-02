@@ -369,6 +369,20 @@ async def check_forbidden(chat_id: int, text: str) -> str | None:
     return None
 
 
+def is_forwarded_message(msg) -> bool:
+    """
+    Détecte les messages transférés/forwardés.
+    Compatible avec plusieurs versions python-telegram-bot.
+    """
+    return any([
+        getattr(msg, "forward_date", None),
+        getattr(msg, "forward_from", None),
+        getattr(msg, "forward_from_chat", None),
+        getattr(msg, "forward_sender_name", None),
+        getattr(msg, "forward_origin", None),
+    ])
+
+
 async def get_or_create_join_time(chat_id: int, user_id: int) -> int:
     """
     Telegram peut parfois rater/retarder l'événement de join.
@@ -450,6 +464,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Enregistre un fallback d'arrivée au premier message vu.
     # Ça rend la règle média 2 minutes beaucoup plus fiable si Telegram rate le join.
     joined_at = await get_or_create_join_time(msg.chat_id, user.id)
+
+    # Forward :
+    # - forward normal = supprimé
+    # - forward avec lien/@ = ban direct
+    # - forward dans les 2 minutes après arrivée/rejoin = ban direct
+    if is_forwarded_message(msg):
+        await delete_safely(context, msg.chat_id, msg.message_id)
+
+        if (text and (URL_RE.search(text) or AT_RE.search(text))) or int(time.time()) - int(joined_at) <= 120:
+            await ban_user(context, msg.chat_id, user.id)
+
+        return
 
     # Règle prioritaire, même si le groupe est ON ou OFF :
     # média interdit pour utilisateurs normaux.
