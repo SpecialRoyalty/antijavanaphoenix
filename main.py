@@ -189,6 +189,16 @@ async def init_db():
             owner_id BIGINT NOT NULL,
             PRIMARY KEY(campaign_id, joined_user_id)
         );
+
+        CREATE TABLE IF NOT EXISTS pending_reward_joins (
+            campaign_id BIGINT NOT NULL REFERENCES reward_campaigns(id) ON DELETE CASCADE,
+            chat_id BIGINT NOT NULL,
+            joined_user_id BIGINT NOT NULL,
+            owner_id BIGINT NOT NULL,
+            invite_link TEXT NOT NULL,
+            joined_at BIGINT NOT NULL,
+            PRIMARY KEY(campaign_id, joined_user_id)
+        );
         """)
 
         await con.execute("""
@@ -524,6 +534,123 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+def progress_text(count: int, required: int) -> str:
+    remaining = max(required - count, 0)
+
+    if remaining <= 0:
+        return "🎁 C’EST BON !"
+    if remaining == 1:
+        return "🚨 DERNIÈRE ÉTAPE !\n\nPlus qu’1 personne et tu débloques tout 😈"
+    if remaining == 2:
+        return "🔥 Encore 2 personnes !\nTu es proche du but…"
+
+    return f"🔥 Encore {remaining} personnes !\nContinue, tu avances bien."
+
+
+async def notify_progress(context: ContextTypes.DEFAULT_TYPE, owner_id: int, campaign_id: int, count: int, required: int):
+    try:
+        await context.bot.send_message(
+            owner_id,
+            "🔔 +1 validé !\n\n"
+            f"Progression : {count}/{required}\n\n"
+            f"{progress_text(count, required)}",
+        )
+    except Exception as e:
+        log.info("progress notification failed for %s: %s", owner_id, e)
+
+
+async def validate_pending_join(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Le join ne compte que si la personne reste au moins 5 minutes.
+    """
+    data = context.job.data or {}
+    campaign_id = int(data["campaign_id"])
+    joined_user_id = int(data["joined_user_id"])
+
+    pending = await DB.fetchrow("""
+        SELECT campaign_id, chat_id, joined_user_id, owner_id
+        FROM pending_reward_joins
+        WHERE campaign_id=$1 AND joined_user_id=$2
+    """, campaign_id, joined_user_id)
+
+    if not pending:
+        return
+
+    chat_id = int(pending["chat_id"])
+    owner_id = int(pending["owner_id"])
+
+    try:
+        member = await context.bot.get_chat_member(chat_id, joined_user_id)
+        if member.status in ("left", "kicked"):
+            await DB.execute(
+                "DELETE FROM pending_reward_joins WHERE campaign_id=$1 AND joined_user_id=$2",
+                campaign_id,
+                joined_user_id,
+            )
+            return
+    except Exception as e:
+        log.info("validate pending join failed: %s", e)
+        return
+
+    inserted = await DB.execute("""
+        INSERT INTO reward_joined(campaign_id, chat_id, joined_user_id, owner_id)
+        VALUES($1, $2, $3, $4)
+        ON CONFLICT DO NOTHING
+    """, campaign_id, chat_id, joined_user_id, owner_id)
+
+    await DB.execute(
+        "DELETE FROM pending_reward_joins WHERE campaign_id=$1 AND joined_user_id=$2",
+        campaign_id,
+        joined_user_id,
+    )
+
+    if not inserted.endswith("1"):
+        return
+
+    count = await DB.fetchval("""
+        UPDATE reward_links
+        SET joins_count=joins_count+1
+        WHERE campaign_id=$1 AND owner_id=$2
+        RETURNING joins_count
+    """, campaign_id, owner_id)
+
+    campaign = await DB.fetchrow("""
+        SELECT gofile_link, required_joins
+        FROM reward_campaigns
+        WHERE id=$1
+    """, campaign_id)
+
+    if not campaign:
+        return
+
+    required = int(campaign["required_joins"])
+
+    if int(count) >= required:
+        delivered = await DB.fetchval("""
+            SELECT delivered
+            FROM reward_links
+            WHERE campaign_id=$1 AND owner_id=$2
+        """, campaign_id, owner_id)
+
+        if not delivered:
+            try:
+                await context.bot.send_message(
+                    owner_id,
+                    "🎁 C’EST BON !\n\n"
+                    "Tu as débloqué la récompense 🔥\n\n"
+                    f"👉 {campaign['gofile_link']}",
+                )
+                await DB.execute("""
+                    UPDATE reward_links
+                    SET delivered=TRUE
+                    WHERE campaign_id=$1 AND owner_id=$2
+                """, campaign_id, owner_id)
+            except Exception as e:
+                log.warning("Impossible d’envoyer le Gofile en PV à %s: %s", owner_id, e)
+    else:
+        await notify_progress(context, owner_id, campaign_id, int(count), required)
+
+
 async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cmu = update.chat_member
 
@@ -562,51 +689,30 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if row["owner_id"] == user_id:
             return
 
+        already_counted = await DB.fetchval("""
+            SELECT 1
+            FROM reward_joined
+            WHERE campaign_id=$1 AND joined_user_id=$2
+        """, row["campaign_id"], user_id)
+
+        if already_counted:
+            return
+
         inserted = await DB.execute("""
-            INSERT INTO reward_joined(campaign_id, chat_id, joined_user_id, owner_id)
-            VALUES($1, $2, $3, $4)
+            INSERT INTO pending_reward_joins(campaign_id, chat_id, joined_user_id, owner_id, invite_link, joined_at)
+            VALUES($1, $2, $3, $4, $5, $6)
             ON CONFLICT DO NOTHING
-        """, row["campaign_id"], GROUP_ID, user_id, row["owner_id"])
+        """, row["campaign_id"], GROUP_ID, user_id, row["owner_id"], inv, int(time.time()))
 
-        if not inserted.endswith("1"):
-            return
-
-        count = await DB.fetchval("""
-            UPDATE reward_links
-            SET joins_count=joins_count+1
-            WHERE campaign_id=$1 AND owner_id=$2
-            RETURNING joins_count
-        """, row["campaign_id"], row["owner_id"])
-
-        campaign = await DB.fetchrow("""
-            SELECT gofile_link, required_joins
-            FROM reward_campaigns
-            WHERE id=$1
-        """, row["campaign_id"])
-
-        if not campaign:
-            return
-
-        if count >= campaign["required_joins"]:
-            delivered = await DB.fetchval("""
-                SELECT delivered
-                FROM reward_links
-                WHERE campaign_id=$1 AND owner_id=$2
-            """, row["campaign_id"], row["owner_id"])
-
-            if not delivered:
-                try:
-                    await context.bot.send_message(
-                        row["owner_id"],
-                        f"🎁 Bravo ! Voici ton lien :\n{campaign['gofile_link']}",
-                    )
-                    await DB.execute("""
-                        UPDATE reward_links
-                        SET delivered=TRUE
-                        WHERE campaign_id=$1 AND owner_id=$2
-                    """, row["campaign_id"], row["owner_id"])
-                except Exception as e:
-                    log.warning("Impossible d’envoyer le Gofile en PV à %s: %s", row["owner_id"], e)
+        if inserted.endswith("1"):
+            context.job_queue.run_once(
+                validate_pending_join,
+                300,
+                data={
+                    "campaign_id": int(row["campaign_id"]),
+                    "joined_user_id": int(user_id),
+                },
+            )
 
 
 async def list_active_rewards(user_id: int, context: ContextTypes.DEFAULT_TYPE):
@@ -636,8 +742,9 @@ async def list_active_rewards(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             user_id,
             "Tu as déjà un challenge en cours. Termine-le avant d’en ouvrir un autre.\n\n"
-            f"{invite}\n\n"
-            f"Progression : {count}/{required}",
+            f"Lien :\n{invite}\n\n"
+            f"Progression : {count}/{required}\n"
+            f"{progress_text(int(count), int(required))}",
             reply_markup=kb,
         )
         return
@@ -715,8 +822,9 @@ async def send_personal_share(user_id: int, context: ContextTypes.DEFAULT_TYPE, 
         await context.bot.send_message(
             user_id,
             "Tu as déjà un challenge en cours. Termine-le avant d’en ouvrir un autre.\n\n"
-            f"{invite}\n\n"
-            f"Progression : {count}/{required}",
+            f"Lien :\n{invite}\n\n"
+            f"Progression : {count}/{required}\n"
+            f"{progress_text(int(count), int(required))}",
             reply_markup=kb,
         )
         return
@@ -749,7 +857,7 @@ async def send_personal_share(user_id: int, context: ContextTypes.DEFAULT_TYPE, 
     if delivered:
         await context.bot.send_message(
             user_id,
-            f"✅ Récompense déjà débloquée. Voici ton lien :\n{campaign['gofile_link']}",
+            f"✅ Récompense déjà débloquée. Voici ton lien privé :\n{campaign['gofile_link']}",
         )
         return
 
@@ -761,14 +869,16 @@ async def send_personal_share(user_id: int, context: ContextTypes.DEFAULT_TYPE, 
         [InlineKeyboardButton("🔄 Rafraîchir progression", callback_data=f"refresh:{campaign_id}")],
     ])
 
+    required = int(campaign["required_joins"])
     await context.bot.send_message(
         user_id,
-        "Partage ce lien personnalisé.\n\n"
-        f"Quand {campaign['required_joins']} personnes rejoignent avec TON lien, "
-        "tu reçois le lien ici.\n\n"
-        "Tu peux également suivre ta progression.\n\n"
-        f"{invite}\n\n"
-        f"Progression : {count}/{campaign['required_joins']}",
+        "🔥 Gagne un accès exclusif\n\n"
+        "Partage TON lien personnalisé.\n\n"
+        f"Dès que {required} personnes rejoignent avec ton lien, "
+        "tu débloques automatiquement le contenu ici.\n\n"
+        f"Lien :\n{invite}\n\n"
+        f"Progression : {count}/{required}\n"
+        f"{progress_text(int(count), required)}",
         reply_markup=kb,
     )
 
