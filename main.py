@@ -82,6 +82,7 @@ def admin_panel() -> InlineKeyboardMarkup:
             InlineKeyboardButton("✍️ Texte pub", callback_data="set_reward_text"),
         ],
         [InlineKeyboardButton("🖼 Image pub", callback_data="set_reward_image")],
+        [InlineKeyboardButton("🎛 Gérer récompenses", callback_data="manage_rewards")],
         [InlineKeyboardButton("🚀 Publish nouvelle récompense", callback_data="publish")],
     ])
 
@@ -638,8 +639,6 @@ async def validate_pending_join(context: ContextTypes.DEFAULT_TYPE):
                     owner_id,
                     "🎁 C’EST BON !\n\n"
                     "Tu as débloqué la récompense 🔥\n\n"
-                    "Ce lien est totalement confidentiel et traqué.\n\n"
-                    "Si tu le partages, tu seras banni et le lien sera révoqué..\n\n"
                     f"👉 {campaign['gofile_link']}",
                 )
                 await DB.execute("""
@@ -744,7 +743,9 @@ async def list_active_rewards(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             user_id,
             "Tu as déjà un challenge en cours. Termine-le avant d’en ouvrir un autre.\n\n"
-            f"Lien :\n{invite}\n\n"
+            "Attention : chaque récompense a son propre lien.\n"
+            "Continue avec CE lien jusqu’à débloquer la récompense.\n\n"
+            f"Ton lien en cours :\n{invite}\n\n"
             f"Progression : {count}/{required}\n"
             f"{progress_text(int(count), int(required))}",
             reply_markup=kb,
@@ -824,7 +825,9 @@ async def send_personal_share(user_id: int, context: ContextTypes.DEFAULT_TYPE, 
         await context.bot.send_message(
             user_id,
             "Tu as déjà un challenge en cours. Termine-le avant d’en ouvrir un autre.\n\n"
-            f"Lien :\n{invite}\n\n"
+            "Attention : chaque récompense a son propre lien.\n"
+            "Continue avec CE lien jusqu’à débloquer la récompense.\n\n"
+            f"Ton lien en cours :\n{invite}\n\n"
             f"Progression : {count}/{required}\n"
             f"{progress_text(int(count), int(required))}",
             reply_markup=kb,
@@ -875,10 +878,11 @@ async def send_personal_share(user_id: int, context: ContextTypes.DEFAULT_TYPE, 
     await context.bot.send_message(
         user_id,
         "🔥 Gagne un accès exclusif\n\n"
-        "Partage TON lien personnalisé.\n\n"
-        f"Dès que {required} personnes rejoignent avec ton lien, "
+        "Chaque récompense a son propre challenge et son propre lien.\n"
+        "Utilise uniquement le lien affiché ici pour cette récompense.\n\n"
+        f"Dès que {required} personnes rejoignent avec TON lien, "
         "tu débloques automatiquement le contenu ici.\n\n"
-        f"Lien :\n{invite}\n\n"
+        f"Ton lien pour CETTE récompense :\n{invite}\n\n"
         f"Progression : {count}/{required}\n"
         f"{progress_text(int(count), required)}",
         reply_markup=kb,
@@ -916,6 +920,115 @@ async def bot_info_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     lines.append(f"Utilisateurs PV enregistrés : {users}")
     lines.append(f"Récompenses actives : {campaigns}")
     lines.append(f"Bot username : @{BOT_USERNAME}" if BOT_USERNAME else "Bot username : inconnu")
+
+    return "\n".join(lines)
+
+
+
+async def admin_rewards_list_text() -> tuple[str, InlineKeyboardMarkup]:
+    rows = await DB.fetch("""
+        SELECT id, active, required_joins, gofile_link
+        FROM reward_campaigns
+        WHERE chat_id=$1
+        ORDER BY id DESC
+        LIMIT 15
+    """, GROUP_ID)
+
+    if not rows:
+        return "Aucune récompense créée.", InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="admin_back")]])
+
+    lines = ["🎛 Récompenses"]
+    buttons = []
+
+    for r in rows:
+        status = "✅ active" if r["active"] else "🛑 désactivée"
+        gofile_status = "🔗 lien OK" if r["gofile_link"] else "⚠️ lien vide"
+        lines.append(f"#{r['id']} — {status} — objectif {r['required_joins']} — {gofile_status}")
+        buttons.append([InlineKeyboardButton(f"🎁 Gérer récompense #{r['id']}", callback_data=f"reward_detail:{r['id']}")])
+
+    buttons.append([InlineKeyboardButton("⬅️ Retour panel", callback_data="admin_back")])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+async def reward_detail_text(campaign_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    r = await DB.fetchrow("""
+        SELECT id, active, required_joins, gofile_link, image_url, promo_text
+        FROM reward_campaigns
+        WHERE id=$1 AND chat_id=$2
+    """, campaign_id, GROUP_ID)
+
+    if not r:
+        return "Récompense introuvable.", InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="manage_rewards")]])
+
+    unlocked = await DB.fetchval("SELECT COUNT(*) FROM reward_links WHERE campaign_id=$1 AND delivered=TRUE", campaign_id)
+    progress = await DB.fetchval("SELECT COUNT(*) FROM reward_links WHERE campaign_id=$1 AND delivered=FALSE", campaign_id)
+    pending = await DB.fetchval("SELECT COUNT(*) FROM pending_reward_joins WHERE campaign_id=$1", campaign_id)
+
+    status = "✅ active" if r["active"] else "🛑 désactivée"
+
+    txt = (
+        f"🎁 Récompense #{campaign_id}\n\n"
+        f"Statut : {status}\n"
+        f"Objectif : {r['required_joins']}\n"
+        f"Débloqués : {unlocked}\n"
+        f"En cours : {progress}\n"
+        f"Joins en attente validation : {pending}\n\n"
+        f"Lien Gofile actuel :\n{r['gofile_link'] or '⚠️ Aucun lien'}\n\n"
+        "Actions disponibles :"
+    )
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Modifier lien Gofile", callback_data=f"reward_edit_gofile:{campaign_id}")],
+        [InlineKeyboardButton("🔁 Republier cette récompense", callback_data=f"reward_republish:{campaign_id}")],
+        [InlineKeyboardButton("📊 Voir stats/users", callback_data=f"reward_stats:{campaign_id}")],
+        [InlineKeyboardButton("🛑 Désactiver/Supprimer", callback_data=f"reward_delete:{campaign_id}")],
+        [InlineKeyboardButton("⬅️ Retour liste", callback_data="manage_rewards")],
+    ])
+
+    return txt, kb
+
+
+async def reward_stats_text(campaign_id: int) -> str:
+    rows_done = await DB.fetch("""
+        SELECT rl.owner_id, rl.joins_count, bu.username, bu.first_name
+        FROM reward_links rl
+        LEFT JOIN bot_users bu ON bu.user_id=rl.owner_id
+        WHERE rl.campaign_id=$1 AND rl.delivered=TRUE
+        ORDER BY rl.joins_count DESC, rl.owner_id
+        LIMIT 50
+    """, campaign_id)
+
+    rows_progress = await DB.fetch("""
+        SELECT rl.owner_id, rl.joins_count, bu.username, bu.first_name
+        FROM reward_links rl
+        LEFT JOIN bot_users bu ON bu.user_id=rl.owner_id
+        WHERE rl.campaign_id=$1 AND rl.delivered=FALSE
+        ORDER BY rl.joins_count DESC, rl.owner_id
+        LIMIT 50
+    """, campaign_id)
+
+    def user_label(r):
+        if r["username"]:
+            return f"@{r['username']} ({r['owner_id']})"
+        if r["first_name"]:
+            return f"{r['first_name']} ({r['owner_id']})"
+        return str(r["owner_id"])
+
+    lines = [f"📊 Stats récompense #{campaign_id}"]
+
+    lines.append("\n✅ Ont débloqué :")
+    if rows_done:
+        for r in rows_done:
+            lines.append(f"- {user_label(r)} — {r['joins_count']} joins")
+    else:
+        lines.append("- Aucun")
+
+    lines.append("\n⏳ En cours :")
+    if rows_progress:
+        for r in rows_progress:
+            lines.append(f"- {user_label(r)} — {r['joins_count']} joins")
+    else:
+        lines.append("- Aucun")
 
     return "\n".join(lines)
 
@@ -958,6 +1071,66 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not await ensure_admin(update, context):
+        return
+
+    if q.data == "admin_back":
+        await q.edit_message_text(await get_admin_panel_text(), reply_markup=admin_panel())
+        return
+
+    if q.data == "manage_rewards":
+        txt, kb = await admin_rewards_list_text()
+        await q.message.reply_text(txt, reply_markup=kb)
+        return
+
+    if q.data.startswith("reward_detail:"):
+        campaign_id = int(q.data.split(":", 1)[1])
+        txt, kb = await reward_detail_text(campaign_id)
+        await q.message.reply_text(txt, reply_markup=kb)
+        return
+
+    if q.data.startswith("reward_edit_gofile:"):
+        campaign_id = int(q.data.split(":", 1)[1])
+        USER_STATE[q.from_user.id] = f"edit_reward_gofile:{campaign_id}"
+        await q.message.reply_text(f"Envoie le nouveau lien Gofile pour la récompense #{campaign_id}.")
+        return
+
+    if q.data.startswith("reward_republish:"):
+        campaign_id = int(q.data.split(":", 1)[1])
+        r = await DB.fetchrow("""
+            SELECT id, active, image_url, promo_text
+            FROM reward_campaigns
+            WHERE id=$1 AND chat_id=$2
+        """, campaign_id, GROUP_ID)
+
+        if not r:
+            await q.message.reply_text("Récompense introuvable.")
+            return
+
+        if not r["active"]:
+            await DB.execute("UPDATE reward_campaigns SET active=TRUE WHERE id=$1 AND chat_id=$2", campaign_id, GROUP_ID)
+
+        image_url = r["image_url"] or REWARD_IMAGE_URL
+        await context.bot.send_photo(
+            GROUP_ID,
+            photo=image_url,
+            caption=r["promo_text"],
+            reply_markup=share_panel(campaign_id),
+        )
+        await q.message.reply_text(f"Récompense #{campaign_id} republiée dans le groupe.")
+        return
+
+    if q.data.startswith("reward_delete:"):
+        campaign_id = int(q.data.split(":", 1)[1])
+        await DB.execute("UPDATE reward_campaigns SET active=FALSE WHERE id=$1 AND chat_id=$2", campaign_id, GROUP_ID)
+        await q.message.reply_text(
+            f"Récompense #{campaign_id} désactivée.\n"
+            "Les stats restent conservées. Tu peux la republier plus tard depuis le menu."
+        )
+        return
+
+    if q.data.startswith("reward_stats:"):
+        campaign_id = int(q.data.split(":", 1)[1])
+        await q.message.reply_text(await reward_stats_text(campaign_id))
         return
 
     if q.data in ("toggle_on", "toggle_off"):
@@ -1038,6 +1211,18 @@ async def private_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     txt = update.message.text.strip()
+
+    if state.startswith("edit_reward_gofile:"):
+        campaign_id = int(state.split(":", 1)[1])
+        await DB.execute(
+            "UPDATE reward_campaigns SET gofile_link=$1 WHERE id=$2 AND chat_id=$3",
+            txt,
+            campaign_id,
+            GROUP_ID,
+        )
+        await update.message.reply_text(f"Lien Gofile modifié pour la récompense #{campaign_id}.")
+        USER_STATE.pop(user_id, None)
+        return
 
     if state == "word_add":
         await DB.execute("""
