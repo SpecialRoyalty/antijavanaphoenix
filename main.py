@@ -638,6 +638,8 @@ async def validate_pending_join(context: ContextTypes.DEFAULT_TYPE):
                     owner_id,
                     "🎁 C’EST BON !\n\n"
                     "Tu as débloqué la récompense 🔥\n\n"
+                    "Ce lien est totalement confidentiel et traqué.\n\n"
+                    "Si tu le partages, tu seras banni et le lien sera révoqué..\n\n"
                     f"👉 {campaign['gofile_link']}",
                 )
                 await DB.execute("""
