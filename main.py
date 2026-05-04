@@ -9,6 +9,13 @@ from datetime import datetime, timedelta, timezone
 
 import asyncpg
 from dotenv import load_dotenv
+
+try:
+    from langdetect import detect_langs, LangDetectException
+except Exception:
+    detect_langs = None
+    LangDetectException = Exception
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -47,6 +54,9 @@ DEFAULT_REWARD_TEXT = (
 
 URL_RE = re.compile(r"(https?://|www\.|t\.me/|telegram\.me/|bit\.ly/|gofile\.io/|discord\.gg/)", re.I)
 AT_RE = re.compile(r"(^|\s)@[a-zA-Z0-9_]{3,32}\b")
+FR_EXTRA_RE = re.compile(r"[àâäçéèêëîïôöùûüÿœæ]", re.I)
+LANG_MIN_LETTERS = int(os.getenv("LANG_MIN_LETTERS", "18"))
+LANG_CONFIDENCE = float(os.getenv("LANG_CONFIDENCE", "0.85"))
 
 DB: asyncpg.Pool | None = None
 USER_STATE: dict[int, str] = {}
@@ -380,6 +390,47 @@ async def check_forbidden(chat_id: int, text: str) -> str | None:
     return None
 
 
+def should_ban_non_french(text: str) -> tuple[bool, str]:
+    """
+    Détection langue via langdetect.
+    Retourne (True, langue) si le message semble clairement non-français.
+    Sécurité anti-faux positifs :
+    - ignore les messages trop courts
+    - ignore si langdetect n'est pas installé
+    - demande une confiance suffisante
+    """
+    if not text or not detect_langs:
+        return False, ""
+
+    clean = re.sub(r"https?://\S+|www\.\S+|@\w+", " ", text)
+    letters = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]", clean)
+
+    if len(letters) < LANG_MIN_LETTERS:
+        return False, ""
+
+    # Beaucoup de français courts sont mal détectés ; les accents aident à confirmer.
+    try:
+        langs = detect_langs(clean)
+    except LangDetectException:
+        return False, ""
+
+    if not langs:
+        return False, ""
+
+    top = langs[0]
+    lang = top.lang
+    prob = float(top.prob)
+
+    if lang == "fr":
+        return False, lang
+
+    # Si le texte contient des accents français, on évite de ban sauf confiance très forte.
+    if FR_EXTRA_RE.search(clean) and prob < 0.95:
+        return False, lang
+
+    return prob >= LANG_CONFIDENCE, lang
+
+
 def is_forwarded_message(msg) -> bool:
     """
     Détecte les messages transférés/forwardés.
@@ -512,6 +563,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text and await check_forbidden(msg.chat_id, text):
         await delete_safely(context, msg.chat_id, msg.message_id)
         await punish_forbidden_word(context, msg.chat_id, user.id)
+        return
+
+    # Langue non française détectée clairement = ban direct.
+    # Fonctionne ON ou OFF. Pas de message public.
+    ban_lang, detected_lang = should_ban_non_french(text)
+    if text and ban_lang:
+        await delete_safely(context, msg.chat_id, msg.message_id)
+        await ban_user(context, msg.chat_id, user.id)
+        log.info("Banned non-French message from %s detected=%s text=%r", user.id, detected_lang, text[:80])
         return
 
     # Message texte envoyé dans les 2 minutes après arrivée/rejoin => mute 1 jour.
@@ -1198,7 +1258,50 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=share_panel(campaign_id),
         )
 
-        await q.message.reply_text(f"Publication envoyée dans le groupe. Récompense #{campaign_id} créée.")
+        ok, fail = await notify_previous_winners_new_challenge(context, campaign_id)
+
+        await q.message.reply_text(
+            f"Publication envoyée dans le groupe. Récompense #{campaign_id} créée.\n"
+            f"Anciens gagnants prévenus en PV : {ok}. Échecs : {fail}."
+        )
+
+
+async def notify_previous_winners_new_challenge(context: ContextTypes.DEFAULT_TYPE, campaign_id: int) -> tuple[int, int]:
+    """
+    Préviens uniquement les anciens gagnants quand une nouvelle récompense est publiée.
+    """
+    rows = await DB.fetch("""
+        SELECT DISTINCT rl.owner_id
+        FROM reward_links rl
+        JOIN bot_users bu ON bu.user_id = rl.owner_id
+        WHERE rl.delivered=TRUE
+          AND bu.started_private=TRUE
+    """)
+
+    ok = 0
+    fail = 0
+
+    if BOT_USERNAME:
+        url = f"https://t.me/{BOT_USERNAME}?start=reward_{campaign_id}"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎁 Recevoir mon lien", url=url)]])
+    else:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎁 Recevoir mon lien", callback_data=f"share:{campaign_id}")]])
+
+    for r in rows:
+        try:
+            await context.bot.send_message(
+                r["owner_id"],
+                "🔥 Nouveau challenge dispo !\n\n"
+                "Tu as déjà débloqué une récompense avant.\n"
+                "Un nouveau contenu est disponible maintenant.\n\n"
+                "Clique pour recevoir ton nouveau lien personnalisé 👇",
+                reply_markup=kb,
+            )
+            ok += 1
+        except Exception:
+            fail += 1
+
+    return ok, fail
 
 
 async def private_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
