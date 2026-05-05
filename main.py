@@ -1,3 +1,6 @@
+# V17 FULL CLEAN — Promo Guard Bot Railway
+# Contient : rewards, gestion admin, notifications anciens gagnants, join validé 5 min,
+# modération liens/@/forward/langue/médias, slash mute groupe.
 import os
 import re
 import time
@@ -55,7 +58,7 @@ DEFAULT_REWARD_TEXT = (
 URL_RE = re.compile(r"(https?://|www\.|t\.me/|telegram\.me/|bit\.ly/|gofile\.io/|discord\.gg/)", re.I)
 AT_RE = re.compile(r"(^|\s)@[a-zA-Z0-9_]{3,32}\b")
 FR_EXTRA_RE = re.compile(r"[àâäçéèêëîïôöùûüÿœæ]", re.I)
-LANG_MIN_LETTERS = int(os.getenv("LANG_MIN_LETTERS", "18"))
+LANG_MIN_LETTERS = int(os.getenv("LANG_MIN_LETTERS", "3"))
 LANG_CONFIDENCE = float(os.getenv("LANG_CONFIDENCE", "0.85"))
 
 DB: asyncpg.Pool | None = None
@@ -287,6 +290,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await save_user(update.effective_user, started_private=(update.effective_chat.type == "private"))
 
     if update.effective_chat.type != "private":
+        # /start dans le groupe = mute 1 mois pour les non-admins.
+        if not await is_admin(update, context, update.effective_user.id, update.effective_chat.id):
+            await mute_user(context, update.effective_chat.id, update.effective_user.id, 30)
         await delete_safely(context, update.effective_chat.id, update.effective_message.message_id)
         return
 
@@ -313,6 +319,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
+        # /admin dans le groupe = mute 1 mois pour les non-admins.
+        if not await is_admin(update, context, update.effective_user.id, update.effective_chat.id):
+            await mute_user(context, update.effective_chat.id, update.effective_user.id, 30)
         await delete_safely(context, update.effective_chat.id, update.effective_message.message_id)
         return
 
@@ -522,6 +531,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = msg.text or msg.caption or ""
+
+    # Toute commande "/" dans le groupe = mute 1 mois pour les non-admins.
+    # L'utilisateur peut lire, mais ne peut plus écrire.
+    if msg.text and msg.text.strip().startswith("/"):
+        await delete_safely(context, msg.chat_id, msg.message_id)
+        await mute_user(context, msg.chat_id, user.id, 30)
+        return
 
     # Enregistre un fallback d'arrivée au premier message vu.
     # Ça rend la règle média 2 minutes beaucoup plus fiable si Telegram rate le join.
