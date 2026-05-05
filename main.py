@@ -216,6 +216,14 @@ async def init_db():
             joined_at BIGINT NOT NULL,
             PRIMARY KEY(campaign_id, joined_user_id)
         );
+
+        CREATE TABLE IF NOT EXISTS reward_reports (
+            id BIGSERIAL PRIMARY KEY,
+            campaign_id BIGINT NOT NULL REFERENCES reward_campaigns(id) ON DELETE CASCADE,
+            user_id BIGINT NOT NULL,
+            report_type TEXT NOT NULL,
+            created_at BIGINT NOT NULL
+        );
         """)
 
         await con.execute("""
@@ -315,7 +323,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(await get_admin_panel_text(), reply_markup=admin_panel())
     else:
         await update.message.reply_text(
-            "Bienvenue. Clique pour choisir une récompense et recevoir ton lien personnalisé de partage.",
+            "Bienvenue. Clique pour voir les récompenses disponibles.",
             reply_markup=user_home_panel(),
         )
 
@@ -796,74 +804,54 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
 
+
 async def list_active_rewards(user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    active_challenge = await DB.fetchrow("""
-        SELECT rl.campaign_id, rl.invite_link, rl.joins_count, rc.required_joins
-        FROM reward_links rl
-        JOIN reward_campaigns rc ON rc.id = rl.campaign_id
-        WHERE rl.owner_id=$1
-          AND rl.delivered=FALSE
-          AND rc.active=TRUE
-        ORDER BY rl.created_at DESC
-        LIMIT 1
-    """, user_id)
-
-    if active_challenge:
-        invite = active_challenge["invite_link"]
-        count = active_challenge["joins_count"]
-        required = active_challenge["required_joins"]
-        share_text = f"Rejoins ce groupe pour débloquer une récompense : {invite}"
-        share_url = f"https://t.me/share/url?url={quote_plus(invite)}&text={quote_plus(share_text)}"
-
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📤 Envoyer mon lien en cours", url=share_url)],
-            [InlineKeyboardButton("🔄 Rafraîchir progression", callback_data=f"refresh:{active_challenge['campaign_id']}")],
-        ])
-
-        await context.bot.send_message(
-            user_id,
-            "Tu as déjà un challenge en cours. Termine-le avant d’en ouvrir un autre.\n\n"
-            "Attention : chaque récompense a son propre lien.\n"
-            "Continue avec CE lien jusqu’à débloquer la récompense.\n\n"
-            f"Ton lien en cours :\n{invite}\n\n"
-            f"Progression : {count}/{required}\n"
-            f"{progress_text(int(count), int(required))}",
-            reply_markup=kb,
-        )
-        return
-
     rows = await DB.fetch("""
-        SELECT id, promo_text, required_joins, created_at
+        SELECT id, required_joins, is_free, active
         FROM reward_campaigns
         WHERE chat_id=$1 AND active=TRUE
-        ORDER BY id DESC
-        LIMIT 10
+        ORDER BY id ASC
+        LIMIT 30
     """, GROUP_ID)
 
     if not rows:
         await context.bot.send_message(user_id, "Aucune récompense active pour le moment.")
         return
 
-    buttons = []
-    lines = ["🎁 Récompenses actives :"]
+    active = await DB.fetchrow("""
+        SELECT rl.campaign_id, rl.joins_count, rc.required_joins
+        FROM reward_links rl
+        JOIN reward_campaigns rc ON rc.id=rl.campaign_id
+        WHERE rl.owner_id=$1 AND rl.delivered=FALSE AND rc.active=TRUE AND rc.is_free=FALSE
+        ORDER BY rl.created_at DESC
+        LIMIT 1
+    """, user_id)
+    active_id = int(active["campaign_id"]) if active else None
 
+    buttons = []
     for r in rows:
-        lines.append(f"\n#{r['id']} — objectif {r['required_joins']} invitations")
-        buttons.append([
-            InlineKeyboardButton(
-                f"🔐 Mot de passe — #{r['id']}",
-                callback_data=f"share:{r['id']}",
-            )
-        ])
+        cid = int(r["id"])
+        link = await DB.fetchrow("SELECT joins_count, delivered FROM reward_links WHERE campaign_id=$1 AND owner_id=$2", cid, user_id)
+        if r["is_free"]:
+            label = f"📁 Fichier #{cid} 🆓 Gratuit"
+        elif link and link["delivered"]:
+            label = f"📁 Fichier #{cid} ✅ Débloqué"
+        elif active_id == cid:
+            label = f"📁 Fichier #{cid} ✅ En cours {link['joins_count']}/{r['required_joins']}"
+        elif active_id and active_id != cid:
+            label = f"📁 Fichier #{cid} ❌ Bloqué"
+        else:
+            label = f"📁 Fichier #{cid} 🔐 Disponible"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"reward_open:{cid}")])
 
     await context.bot.send_message(
         user_id,
-        "\n".join(lines),
+        "🎁 Récompenses disponibles :\n\n📌 Chaque récompense a son propre défi.\nTu peux voir la liste complète ici.",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
 
-async def send_personal_share(user_id: int, context: ContextTypes.DEFAULT_TYPE, campaign_id: int):
+async def open_reward_view(user_id: int, context: ContextTypes.DEFAULT_TYPE, campaign_id: int):
     campaign = await DB.fetchrow("""
         SELECT id, gofile_link, password, required_joins, is_free, active
         FROM reward_campaigns
@@ -871,57 +859,17 @@ async def send_personal_share(user_id: int, context: ContextTypes.DEFAULT_TYPE, 
     """, campaign_id, GROUP_ID)
 
     if not campaign or not campaign["active"]:
-        await context.bot.send_message(
-            user_id,
-            "Cette récompense n’est plus active.",
-            reply_markup=user_home_panel(),
-        )
+        await context.bot.send_message(user_id, "Cette récompense n’est plus active.")
         return
 
-    if campaign["is_free"]:
-        await context.bot.send_message(
-            user_id,
-            "🆓 Récompense gratuite accessible maintenant.\n\n"
-            f"🔗 Lien : {campaign['gofile_link']}\n"
-            f"🔐 Mot de passe : {campaign['password'] or 'Aucun'}",
-        )
-        return
-
-    active_challenge = await DB.fetchrow("""
-        SELECT rl.campaign_id, rl.invite_link, rl.joins_count, rc.required_joins
+    active = await DB.fetchrow("""
+        SELECT rl.campaign_id
         FROM reward_links rl
-        JOIN reward_campaigns rc ON rc.id = rl.campaign_id
-        WHERE rl.owner_id=$1
-          AND rl.delivered=FALSE
-          AND rc.active=TRUE
+        JOIN reward_campaigns rc ON rc.id=rl.campaign_id
+        WHERE rl.owner_id=$1 AND rl.delivered=FALSE AND rc.active=TRUE AND rc.is_free=FALSE
         ORDER BY rl.created_at DESC
         LIMIT 1
     """, user_id)
-
-    if active_challenge and int(active_challenge["campaign_id"]) != int(campaign_id):
-        invite = active_challenge["invite_link"]
-        count = active_challenge["joins_count"]
-        required = active_challenge["required_joins"]
-
-        share_text = f"Rejoins ce groupe pour débloquer une récompense : {invite}"
-        share_url = f"https://t.me/share/url?url={quote_plus(invite)}&text={quote_plus(share_text)}"
-
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📤 Envoyer mon lien en cours", url=share_url)],
-            [InlineKeyboardButton("🔄 Rafraîchir progression", callback_data=f"refresh:{active_challenge['campaign_id']}")],
-        ])
-
-        await context.bot.send_message(
-            user_id,
-            "Tu as déjà un challenge en cours. Termine-le avant d’en ouvrir un autre.\n\n"
-            "Attention : chaque récompense a son propre lien.\n"
-            "Continue avec CE lien jusqu’à débloquer la récompense.\n\n"
-            f"Ton lien en cours :\n{invite}\n\n"
-            f"Progression : {count}/{required}\n"
-            f"{progress_text(int(count), int(required))}",
-            reply_markup=kb,
-        )
-        return
 
     row = await DB.fetchrow("""
         SELECT invite_link, joins_count, delivered
@@ -929,55 +877,66 @@ async def send_personal_share(user_id: int, context: ContextTypes.DEFAULT_TYPE, 
         WHERE campaign_id=$1 AND owner_id=$2
     """, campaign_id, user_id)
 
-    if not row:
-        link = await context.bot.create_chat_invite_link(
-            GROUP_ID,
-            name=f"c{campaign_id}_u{user_id}"[:32],
-        )
+    report_buttons = [
+        [InlineKeyboardButton("⚠️ Signaler lien mort", callback_data=f"report:dead:{campaign_id}")],
+        [InlineKeyboardButton("🐞 Signaler un bug", callback_data=f"report:bug:{campaign_id}")],
+        [InlineKeyboardButton("⬅️ Retour aux récompenses", callback_data="rewards_list")],
+    ]
 
-        await DB.execute("""
-            INSERT INTO reward_links(campaign_id, chat_id, owner_id, invite_link, created_at)
-            VALUES($1, $2, $3, $4, $5)
-        """, campaign_id, GROUP_ID, user_id, link.invite_link, int(time.time()))
-
-        invite = link.invite_link
-        count = 0
-        delivered = False
-    else:
-        invite = row["invite_link"]
-        count = row["joins_count"]
-        delivered = row["delivered"]
-
-    if delivered:
+    if campaign["is_free"] or (row and row["delivered"]):
+        title = "🆓 Récompense gratuite" if campaign["is_free"] else "✅ Récompense déjà débloquée"
         await context.bot.send_message(
             user_id,
-            "✅ Mot de passe déjà débloqué.\n\n"
-            f"🔗 Lien : {campaign['gofile_link']}\n"
-            f"🔐 Mot de passe : {campaign['password'] or 'Aucun'}",
+            f"{title}\n\n🔗 Lien : {campaign['gofile_link']}\n🔐 Mot de passe : {campaign['password'] or 'Aucun'}",
+            reply_markup=InlineKeyboardMarkup(report_buttons),
         )
         return
 
-    share_text = f"Rejoins ce groupe pour débloquer une récompense : {invite}"
+    if active and int(active["campaign_id"]) != int(campaign_id):
+        await context.bot.send_message(
+            user_id,
+            "❌ Cette récompense est bloquée pour le moment.\n\nTu as déjà un défi en cours.\nTermine d’abord le fichier en cours avant d’ouvrir celui-ci.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour aux récompenses", callback_data="rewards_list")]]),
+        )
+        return
+
+    if not row:
+        link = await context.bot.create_chat_invite_link(GROUP_ID, name=f"c{campaign_id}_u{user_id}"[:32])
+        await DB.execute("""
+            INSERT INTO reward_links(campaign_id, chat_id, owner_id, invite_link, created_at)
+            VALUES($1,$2,$3,$4,$5)
+        """, campaign_id, GROUP_ID, user_id, link.invite_link, int(time.time()))
+        invite, count = link.invite_link, 0
+    else:
+        invite, count = row["invite_link"], row["joins_count"]
+
+    share_text = f"Rejoins ce groupe pour m’aider à débloquer un mot de passe : {invite}"
     share_url = f"https://t.me/share/url?url={quote_plus(invite)}&text={quote_plus(share_text)}"
+    required = int(campaign["required_joins"])
 
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📤 Envoyer le lien", url=share_url)],
+        [InlineKeyboardButton("📤 Envoyer mon lien", url=share_url)],
         [InlineKeyboardButton("🔄 Rafraîchir progression", callback_data=f"refresh:{campaign_id}")],
+        [InlineKeyboardButton("⚠️ Signaler lien mort", callback_data=f"report:dead:{campaign_id}")],
+        [InlineKeyboardButton("🐞 Signaler un bug", callback_data=f"report:bug:{campaign_id}")],
+        [InlineKeyboardButton("⬅️ Retour aux récompenses", callback_data="rewards_list")],
     ])
 
-    required = int(campaign["required_joins"])
     await context.bot.send_message(
         user_id,
         "🔥 Mot de passe verrouillé\n\n"
         f"🔗 Lien Gofile :\n{campaign['gofile_link']}\n\n"
         "Chaque récompense a son propre défi et son propre lien d’invitation.\n"
-        "Utilise uniquement le lien affiché ici pour cette récompense.\n\n"
         f"Invite {required} personnes avec TON lien pour débloquer le mot de passe.\n\n"
         f"Ton lien d’invitation :\n{invite}\n\n"
         f"Progression : {count}/{required}\n"
         f"{progress_text(int(count), required)}",
         reply_markup=kb,
     )
+
+
+async def send_personal_share(user_id: int, context: ContextTypes.DEFAULT_TYPE, campaign_id: int):
+    await open_reward_view(user_id, context, campaign_id)
 
 
 async def bot_info_text(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -1077,6 +1036,7 @@ async def reward_detail_text(campaign_id: int) -> tuple[str, InlineKeyboardMarku
         [InlineKeyboardButton("🆓 Gratuit ON/OFF", callback_data=f"reward_toggle_free:{campaign_id}")],
         [InlineKeyboardButton("🔁 Republier cette récompense", callback_data=f"reward_republish:{campaign_id}")],
         [InlineKeyboardButton("📊 Voir stats/users", callback_data=f"reward_stats:{campaign_id}")],
+        [InlineKeyboardButton("🚨 Voir signalements", callback_data=f"reward_reports:{campaign_id}")],
         [InlineKeyboardButton("🛑 Désactiver/Supprimer", callback_data=f"reward_delete:{campaign_id}")],
         [InlineKeyboardButton("⬅️ Retour liste", callback_data="manage_rewards")],
     ])
@@ -1145,21 +1105,41 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if q.data.startswith("share:"):
         campaign_id = int(q.data.split(":", 1)[1])
-
         try:
-            await send_personal_share(q.from_user.id, context, campaign_id)
-            await q.answer("Lien personnalisé envoyé ici.", show_alert=True)
+            await open_reward_view(q.from_user.id, context, campaign_id)
+            await q.answer("Interface envoyée ici.", show_alert=False)
         except Exception as e:
             log.warning("share callback failed: %s", e)
             start_link = f"https://t.me/{BOT_USERNAME}?start=reward_{campaign_id}" if BOT_USERNAME else "le bot en privé"
             await q.answer(f"Ouvre d’abord le bot en privé : {start_link}", show_alert=True)
+        return
 
+    if q.data.startswith("reward_open:"):
+        campaign_id = int(q.data.split(":", 1)[1])
+        await open_reward_view(q.from_user.id, context, campaign_id)
+        await q.answer()
+        return
+
+    if q.data.startswith("report:"):
+        _, report_type, campaign_id_s = q.data.split(":", 2)
+        campaign_id = int(campaign_id_s)
+        await DB.execute("""
+            INSERT INTO reward_reports(campaign_id, user_id, report_type, created_at)
+            VALUES($1,$2,$3,$4)
+        """, campaign_id, q.from_user.id, report_type, int(time.time()))
+        await q.answer("Signalement envoyé. Merci.", show_alert=True)
+        for admin_id in ADMIN_IDS:
+            try:
+                label = "lien mort" if report_type == "dead" else "bug"
+                await context.bot.send_message(admin_id, f"⚠️ Signalement {label}\nRécompense #{campaign_id}\nUser : {q.from_user.id}")
+            except Exception:
+                pass
         return
 
     if q.data.startswith("refresh:"):
         campaign_id = int(q.data.split(":", 1)[1])
         try:
-            await send_personal_share(q.from_user.id, context, campaign_id)
+            await open_reward_view(q.from_user.id, context, campaign_id)
             await q.answer("Progression rafraîchie.", show_alert=False)
         except Exception as e:
             log.warning("refresh failed: %s", e)
@@ -1252,6 +1232,25 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(await reward_stats_text(campaign_id))
         return
 
+    if q.data.startswith("reward_reports:"):
+        campaign_id = int(q.data.split(":", 1)[1])
+        rows = await DB.fetch("""
+            SELECT user_id, report_type, created_at
+            FROM reward_reports
+            WHERE campaign_id=$1
+            ORDER BY created_at DESC
+            LIMIT 50
+        """, campaign_id)
+        if not rows:
+            await q.message.reply_text(f"Aucun signalement pour la récompense #{campaign_id}.")
+        else:
+            lines = [f"🚨 Signalements récompense #{campaign_id}"]
+            for r in rows:
+                label = "lien mort" if r["report_type"] == "dead" else "bug"
+                lines.append(f"- {label} — user {r['user_id']}")
+            await q.message.reply_text("\n".join(lines))
+        return
+
     if q.data in ("toggle_on", "toggle_off"):
         val = q.data == "toggle_on"
         await DB.execute("UPDATE settings SET messages_open=$1 WHERE chat_id=$2", val, GROUP_ID)
@@ -1296,41 +1295,29 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-async def notify_previous_winners_new_challenge(context: ContextTypes.DEFAULT_TYPE, campaign_id: int) -> tuple[int, int]:
-    """
-    Préviens uniquement les anciens gagnants quand une nouvelle récompense est publiée.
-    """
-    rows = await DB.fetch("""
-        SELECT DISTINCT rl.owner_id
-        FROM reward_links rl
-        JOIN bot_users bu ON bu.user_id = rl.owner_id
-        WHERE rl.delivered=TRUE
-          AND bu.started_private=TRUE
-    """)
-
-    ok = 0
-    fail = 0
-
+async def notify_all_users_new_challenge(context: ContextTypes.DEFAULT_TYPE, campaign_id: int) -> tuple[int, int]:
+    rows = await DB.fetch("SELECT DISTINCT user_id FROM bot_users WHERE started_private=TRUE")
+    ok = fail = 0
     if BOT_USERNAME:
         url = f"https://t.me/{BOT_USERNAME}?start=reward_{campaign_id}"
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Recevoir le mot de passe", url=url)]])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Voir le nouveau contenu", url=url)]])
     else:
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Recevoir le mot de passe", callback_data=f"share:{campaign_id}")]])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Voir le nouveau contenu", callback_data=f"share:{campaign_id}")]])
+
+    campaign = await DB.fetchrow("SELECT is_free FROM reward_campaigns WHERE id=$1", campaign_id)
+    is_free = bool(campaign["is_free"]) if campaign else False
+    msg = (
+        "🆓 Nouveau contenu gratuit disponible !\n\nClique pour le voir maintenant 👇"
+        if is_free else
+        "🔥 Nouveau challenge disponible !\n\nUn nouveau contenu vient d’être publié.\nClique pour voir le lien et débloquer le mot de passe 👇"
+    )
 
     for r in rows:
         try:
-            await context.bot.send_message(
-                r["owner_id"],
-                "🔥 Nouveau challenge dispo !\n\n"
-                "Tu as déjà débloqué une récompense avant.\n"
-                "Un nouveau contenu est disponible maintenant.\n\n"
-                "Clique pour débloquer le mot de passe du nouveau contenu 👇",
-                reply_markup=kb,
-            )
+            await context.bot.send_message(r["user_id"], msg, reply_markup=kb)
             ok += 1
         except Exception:
             fail += 1
-
     return ok, fail
 
 
@@ -1389,7 +1376,7 @@ async def private_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             reply_markup=share_panel(campaign_id),
         )
 
-        ok, fail = await notify_previous_winners_new_challenge(context, campaign_id)
+        ok, fail = await notify_all_users_new_challenge(context, campaign_id)
 
         USER_STATE.pop(user_id, None)
         CREATE_FLOW.pop(user_id, None)
@@ -1397,7 +1384,7 @@ async def private_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(
             f"Récompense #{campaign_id} créée et publiée.\n"
             f"Type : {'gratuite' if is_free else 'verrouillée'}\n"
-            f"Anciens gagnants prévenus en PV : {ok}. Échecs : {fail}."
+            f"Utilisateurs prévenus en PV : {ok}. Échecs : {fail}."
         )
         return
 
