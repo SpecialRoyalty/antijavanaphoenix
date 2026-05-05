@@ -63,6 +63,7 @@ LANG_CONFIDENCE = float(os.getenv("LANG_CONFIDENCE", "0.85"))
 
 DB: asyncpg.Pool | None = None
 USER_STATE: dict[int, str] = {}
+CREATE_FLOW: dict[int, dict] = {}
 BOT_USERNAME = ""
 
 
@@ -90,10 +91,7 @@ def admin_panel() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📢 Broadcast groupe", callback_data="broadcast_group"),
             InlineKeyboardButton("📨 Broadcast PV", callback_data="broadcast_private"),
         ],
-        [
-            InlineKeyboardButton("🎁 Lien Gofile", callback_data="set_gofile"),
-            InlineKeyboardButton("✍️ Texte pub", callback_data="set_reward_text"),
-        ],
+        [InlineKeyboardButton("✍️ Texte pub", callback_data="set_reward_text")],
         [InlineKeyboardButton("🖼 Image pub", callback_data="set_reward_image")],
         [InlineKeyboardButton("🎛 Gérer récompenses", callback_data="manage_rewards")],
         [InlineKeyboardButton("🚀 Publish nouvelle récompense", callback_data="publish")],
@@ -116,11 +114,11 @@ def share_panel(campaign_id: int) -> InlineKeyboardMarkup:
     if BOT_USERNAME:
         url = f"https://t.me/{BOT_USERNAME}?start=reward_{campaign_id}"
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎁 Recevoir mon lien", url=url)]
+            [InlineKeyboardButton("🔐 Recevoir le mot de passe", url=url)]
         ])
 
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎁 Recevoir mon lien", callback_data=f"share:{campaign_id}")]
+        [InlineKeyboardButton("🔐 Recevoir le mot de passe", callback_data=f"share:{campaign_id}")]
     ])
 
 
@@ -178,12 +176,17 @@ async def init_db():
             id BIGSERIAL PRIMARY KEY,
             chat_id BIGINT NOT NULL,
             gofile_link TEXT NOT NULL,
+            password TEXT DEFAULT '',
+            is_free BOOLEAN DEFAULT FALSE,
             image_url TEXT DEFAULT '',
             promo_text TEXT NOT NULL,
             required_joins INT NOT NULL DEFAULT 6,
             active BOOLEAN DEFAULT TRUE,
             created_at BIGINT NOT NULL
         );
+
+        ALTER TABLE reward_campaigns ADD COLUMN IF NOT EXISTS password TEXT DEFAULT '';
+        ALTER TABLE reward_campaigns ADD COLUMN IF NOT EXISTS is_free BOOLEAN DEFAULT FALSE;
 
         CREATE TABLE IF NOT EXISTS reward_links (
             campaign_id BIGINT NOT NULL REFERENCES reward_campaigns(id) ON DELETE CASCADE,
@@ -692,7 +695,7 @@ async def validate_pending_join(context: ContextTypes.DEFAULT_TYPE):
     """, campaign_id, owner_id)
 
     campaign = await DB.fetchrow("""
-        SELECT gofile_link, required_joins
+        SELECT gofile_link, password, required_joins
         FROM reward_campaigns
         WHERE id=$1
     """, campaign_id)
@@ -714,8 +717,9 @@ async def validate_pending_join(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     owner_id,
                     "🎁 C’EST BON !\n\n"
-                    "Tu as débloqué la récompense 🔥\n\n"
-                    f"👉 {campaign['gofile_link']}",
+                    "Tu as débloqué le mot de passe 🔥\n\n"
+                    f"🔗 Lien : {campaign['gofile_link']}\n"
+                    f"🔐 Mot de passe : {campaign['password'] or 'Aucun'}",
                 )
                 await DB.execute("""
                     UPDATE reward_links
@@ -847,7 +851,7 @@ async def list_active_rewards(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"\n#{r['id']} — objectif {r['required_joins']} invitations")
         buttons.append([
             InlineKeyboardButton(
-                f"🎁 Recevoir mon lien — #{r['id']}",
+                f"🔐 Mot de passe — #{r['id']}",
                 callback_data=f"share:{r['id']}",
             )
         ])
@@ -861,7 +865,7 @@ async def list_active_rewards(user_id: int, context: ContextTypes.DEFAULT_TYPE):
 
 async def send_personal_share(user_id: int, context: ContextTypes.DEFAULT_TYPE, campaign_id: int):
     campaign = await DB.fetchrow("""
-        SELECT id, gofile_link, required_joins, active
+        SELECT id, gofile_link, password, required_joins, is_free, active
         FROM reward_campaigns
         WHERE id=$1 AND chat_id=$2
     """, campaign_id, GROUP_ID)
@@ -871,6 +875,15 @@ async def send_personal_share(user_id: int, context: ContextTypes.DEFAULT_TYPE, 
             user_id,
             "Cette récompense n’est plus active.",
             reply_markup=user_home_panel(),
+        )
+        return
+
+    if campaign["is_free"]:
+        await context.bot.send_message(
+            user_id,
+            "🆓 Récompense gratuite accessible maintenant.\n\n"
+            f"🔗 Lien : {campaign['gofile_link']}\n"
+            f"🔐 Mot de passe : {campaign['password'] or 'Aucun'}",
         )
         return
 
@@ -938,7 +951,9 @@ async def send_personal_share(user_id: int, context: ContextTypes.DEFAULT_TYPE, 
     if delivered:
         await context.bot.send_message(
             user_id,
-            f"✅ Récompense déjà débloquée. Voici ton lien privé :\n{campaign['gofile_link']}",
+            "✅ Mot de passe déjà débloqué.\n\n"
+            f"🔗 Lien : {campaign['gofile_link']}\n"
+            f"🔐 Mot de passe : {campaign['password'] or 'Aucun'}",
         )
         return
 
@@ -953,12 +968,12 @@ async def send_personal_share(user_id: int, context: ContextTypes.DEFAULT_TYPE, 
     required = int(campaign["required_joins"])
     await context.bot.send_message(
         user_id,
-        "🔥 Gagne un accès exclusif\n\n"
-        "Chaque récompense a son propre challenge et son propre lien.\n"
+        "🔥 Mot de passe verrouillé\n\n"
+        f"🔗 Lien Gofile :\n{campaign['gofile_link']}\n\n"
+        "Chaque récompense a son propre défi et son propre lien d’invitation.\n"
         "Utilise uniquement le lien affiché ici pour cette récompense.\n\n"
-        f"Dès que {required} personnes rejoignent avec TON lien, "
-        "tu débloques automatiquement le contenu ici.\n\n"
-        f"Ton lien pour CETTE récompense :\n{invite}\n\n"
+        f"Invite {required} personnes avec TON lien pour débloquer le mot de passe.\n\n"
+        f"Ton lien d’invitation :\n{invite}\n\n"
         f"Progression : {count}/{required}\n"
         f"{progress_text(int(count), required)}",
         reply_markup=kb,
@@ -1028,7 +1043,7 @@ async def admin_rewards_list_text() -> tuple[str, InlineKeyboardMarkup]:
 
 async def reward_detail_text(campaign_id: int) -> tuple[str, InlineKeyboardMarkup]:
     r = await DB.fetchrow("""
-        SELECT id, active, required_joins, gofile_link, image_url, promo_text
+        SELECT id, active, required_joins, gofile_link, password, is_free, image_url, promo_text
         FROM reward_campaigns
         WHERE id=$1 AND chat_id=$2
     """, campaign_id, GROUP_ID)
@@ -1046,15 +1061,20 @@ async def reward_detail_text(campaign_id: int) -> tuple[str, InlineKeyboardMarku
         f"🎁 Récompense #{campaign_id}\n\n"
         f"Statut : {status}\n"
         f"Objectif : {r['required_joins']}\n"
+        f"Type : {'🆓 gratuit' if r['is_free'] else '🔒 mot de passe verrouillé'}\n"
         f"Débloqués : {unlocked}\n"
         f"En cours : {progress}\n"
         f"Joins en attente validation : {pending}\n\n"
         f"Lien Gofile actuel :\n{r['gofile_link'] or '⚠️ Aucun lien'}\n\n"
+        f"Mot de passe actuel :\n{r['password'] or '⚠️ Aucun'}\n\n"
         "Actions disponibles :"
     )
 
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✏️ Modifier lien Gofile", callback_data=f"reward_edit_gofile:{campaign_id}")],
+        [InlineKeyboardButton("🔐 Modifier mot de passe", callback_data=f"reward_edit_password:{campaign_id}")],
+        [InlineKeyboardButton("🎯 Modifier objectif", callback_data=f"reward_edit_required:{campaign_id}")],
+        [InlineKeyboardButton("🆓 Gratuit ON/OFF", callback_data=f"reward_toggle_free:{campaign_id}")],
         [InlineKeyboardButton("🔁 Republier cette récompense", callback_data=f"reward_republish:{campaign_id}")],
         [InlineKeyboardButton("📊 Voir stats/users", callback_data=f"reward_stats:{campaign_id}")],
         [InlineKeyboardButton("🛑 Désactiver/Supprimer", callback_data=f"reward_delete:{campaign_id}")],
@@ -1170,6 +1190,29 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(f"Envoie le nouveau lien Gofile pour la récompense #{campaign_id}.")
         return
 
+    if q.data.startswith("reward_edit_password:"):
+        campaign_id = int(q.data.split(":", 1)[1])
+        USER_STATE[q.from_user.id] = f"edit_reward_password:{campaign_id}"
+        await q.message.reply_text(f"Envoie le nouveau mot de passe pour la récompense #{campaign_id}.")
+        return
+
+    if q.data.startswith("reward_edit_required:"):
+        campaign_id = int(q.data.split(":", 1)[1])
+        USER_STATE[q.from_user.id] = f"edit_reward_required:{campaign_id}"
+        await q.message.reply_text(f"Envoie le nouvel objectif d’invitations pour la récompense #{campaign_id}. Mets 0 pour gratuit.")
+        return
+
+    if q.data.startswith("reward_toggle_free:"):
+        campaign_id = int(q.data.split(":", 1)[1])
+        new_val = await DB.fetchval("""
+            UPDATE reward_campaigns
+            SET is_free = NOT is_free
+            WHERE id=$1 AND chat_id=$2
+            RETURNING is_free
+        """, campaign_id, GROUP_ID)
+        await q.message.reply_text(f"Récompense #{campaign_id} : gratuit = {'ON' if new_val else 'OFF'}.")
+        return
+
     if q.data.startswith("reward_republish:"):
         campaign_id = int(q.data.split(":", 1)[1])
         r = await DB.fetchrow("""
@@ -1219,8 +1262,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "word_del",
         "broadcast_group",
         "broadcast_private",
-        "set_gofile",
-        "set_reward_text",
+                "set_reward_text",
         "set_reward_image",
     ):
         USER_STATE[q.from_user.id] = q.data
@@ -1230,7 +1272,6 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "word_del": "Envoie le mot interdit à supprimer.",
             "broadcast_group": "Envoie le message à broadcaster dans le groupe.",
             "broadcast_private": "Envoie le message à broadcaster en privé aux utilisateurs qui ont déjà démarré le bot.",
-            "set_gofile": "Envoie le nouveau lien Gofile. Il sera utilisé pour la PROCHAINE récompense publiée.",
             "set_reward_text": "Envoie le texte de la prochaine publication. Tu peux changer ce texte à chaque fichier/récompense.",
             "set_reward_image": "Envoie le lien direct de l’image pour les prochaines publications.",
         }
@@ -1246,40 +1287,13 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(await bot_info_text(context))
 
     elif q.data == "publish":
-        row = await DB.fetchrow("""
-            SELECT gofile_link, reward_image_url, reward_text
-            FROM settings
-            WHERE chat_id=$1
-        """, GROUP_ID)
-
-        gofile = row["gofile_link"] if row else ""
-
-        if not gofile:
-            await q.message.reply_text("Ajoute d’abord un lien Gofile.")
-            return
-
-        promo_text = (row["reward_text"] or DEFAULT_REWARD_TEXT).replace("{required}", str(REWARD_REQUIRED_JOINS))
-        image_url = row["reward_image_url"] or REWARD_IMAGE_URL
-
-        campaign_id = await DB.fetchval("""
-            INSERT INTO reward_campaigns(chat_id, gofile_link, image_url, promo_text, required_joins, created_at)
-            VALUES($1, $2, $3, $4, $5, $6)
-            RETURNING id
-        """, GROUP_ID, gofile, image_url, promo_text, REWARD_REQUIRED_JOINS, int(time.time()))
-
-        await context.bot.send_photo(
-            GROUP_ID,
-            photo=image_url,
-            caption=promo_text,
-            reply_markup=share_panel(campaign_id),
-        )
-
-        ok, fail = await notify_previous_winners_new_challenge(context, campaign_id)
-
+        CREATE_FLOW[q.from_user.id] = {}
+        USER_STATE[q.from_user.id] = "create_reward_gofile"
         await q.message.reply_text(
-            f"Publication envoyée dans le groupe. Récompense #{campaign_id} créée.\n"
-            f"Anciens gagnants prévenus en PV : {ok}. Échecs : {fail}."
+            "Création d’une nouvelle récompense.\n\n"
+            "1/3 — Envoie le lien Gofile visible publiquement."
         )
+        return
 
 
 async def notify_previous_winners_new_challenge(context: ContextTypes.DEFAULT_TYPE, campaign_id: int) -> tuple[int, int]:
@@ -1299,9 +1313,9 @@ async def notify_previous_winners_new_challenge(context: ContextTypes.DEFAULT_TY
 
     if BOT_USERNAME:
         url = f"https://t.me/{BOT_USERNAME}?start=reward_{campaign_id}"
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎁 Recevoir mon lien", url=url)]])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Recevoir le mot de passe", url=url)]])
     else:
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎁 Recevoir mon lien", callback_data=f"share:{campaign_id}")]])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Recevoir le mot de passe", callback_data=f"share:{campaign_id}")]])
 
     for r in rows:
         try:
@@ -1310,7 +1324,7 @@ async def notify_previous_winners_new_challenge(context: ContextTypes.DEFAULT_TY
                 "🔥 Nouveau challenge dispo !\n\n"
                 "Tu as déjà débloqué une récompense avant.\n"
                 "Un nouveau contenu est disponible maintenant.\n\n"
-                "Clique pour recevoir ton nouveau lien personnalisé 👇",
+                "Clique pour débloquer le mot de passe du nouveau contenu 👇",
                 reply_markup=kb,
             )
             ok += 1
@@ -1331,6 +1345,62 @@ async def private_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     txt = update.message.text.strip()
 
+    if state == "create_reward_gofile":
+        CREATE_FLOW[user_id] = {"gofile_link": txt}
+        USER_STATE[user_id] = "create_reward_password"
+        await update.message.reply_text("2/3 — Envoie le mot de passe à débloquer. Mets '-' s’il n’y en a pas.")
+        return
+
+    if state == "create_reward_password":
+        CREATE_FLOW.setdefault(user_id, {})["password"] = "" if txt == "-" else txt
+        USER_STATE[user_id] = "create_reward_required"
+        await update.message.reply_text("3/3 — Envoie l’objectif d’invitations. Mets 0 pour une récompense gratuite.")
+        return
+
+    if state == "create_reward_required":
+        try:
+            required = max(0, int(txt))
+        except ValueError:
+            await update.message.reply_text("Envoie un nombre valide. Exemple : 6 ou 0 pour gratuit.")
+            return
+
+        flow = CREATE_FLOW.get(user_id, {})
+        if not flow.get("gofile_link"):
+            USER_STATE.pop(user_id, None)
+            CREATE_FLOW.pop(user_id, None)
+            await update.message.reply_text("Création annulée : lien Gofile manquant.")
+            return
+
+        row = await DB.fetchrow("SELECT reward_image_url, reward_text FROM settings WHERE chat_id=$1", GROUP_ID)
+        image_url = (row["reward_image_url"] if row else "") or REWARD_IMAGE_URL
+        promo_text = ((row["reward_text"] if row else "") or DEFAULT_REWARD_TEXT).replace("{required}", str(required or REWARD_REQUIRED_JOINS))
+
+        is_free = required == 0
+        campaign_id = await DB.fetchval("""
+            INSERT INTO reward_campaigns(chat_id, gofile_link, password, is_free, image_url, promo_text, required_joins, created_at)
+            VALUES($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING id
+        """, GROUP_ID, flow["gofile_link"], flow.get("password", ""), is_free, image_url, promo_text, required or REWARD_REQUIRED_JOINS, int(time.time()))
+
+        await context.bot.send_photo(
+            GROUP_ID,
+            photo=image_url,
+            caption=promo_text,
+            reply_markup=share_panel(campaign_id),
+        )
+
+        ok, fail = await notify_previous_winners_new_challenge(context, campaign_id)
+
+        USER_STATE.pop(user_id, None)
+        CREATE_FLOW.pop(user_id, None)
+
+        await update.message.reply_text(
+            f"Récompense #{campaign_id} créée et publiée.\n"
+            f"Type : {'gratuite' if is_free else 'verrouillée'}\n"
+            f"Anciens gagnants prévenus en PV : {ok}. Échecs : {fail}."
+        )
+        return
+
     if state.startswith("edit_reward_gofile:"):
         campaign_id = int(state.split(":", 1)[1])
         await DB.execute(
@@ -1340,6 +1410,36 @@ async def private_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             GROUP_ID,
         )
         await update.message.reply_text(f"Lien Gofile modifié pour la récompense #{campaign_id}.")
+        USER_STATE.pop(user_id, None)
+        return
+
+    if state.startswith("edit_reward_password:"):
+        campaign_id = int(state.split(":", 1)[1])
+        await DB.execute(
+            "UPDATE reward_campaigns SET password=$1 WHERE id=$2 AND chat_id=$3",
+            "" if txt == "-" else txt,
+            campaign_id,
+            GROUP_ID,
+        )
+        await update.message.reply_text(f"Mot de passe modifié pour la récompense #{campaign_id}.")
+        USER_STATE.pop(user_id, None)
+        return
+
+    if state.startswith("edit_reward_required:"):
+        campaign_id = int(state.split(":", 1)[1])
+        try:
+            required = max(0, int(txt))
+        except ValueError:
+            await update.message.reply_text("Envoie un nombre valide.")
+            return
+        await DB.execute(
+            "UPDATE reward_campaigns SET required_joins=$1, is_free=$2 WHERE id=$3 AND chat_id=$4",
+            required or REWARD_REQUIRED_JOINS,
+            required == 0,
+            campaign_id,
+            GROUP_ID,
+        )
+        await update.message.reply_text(f"Objectif modifié pour la récompense #{campaign_id}. Gratuit = {'ON' if required == 0 else 'OFF'}.")
         USER_STATE.pop(user_id, None)
         return
 
@@ -1390,9 +1490,6 @@ async def private_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         await update.message.reply_text(f"Broadcast PV terminé. Envoyés : {ok}. Échecs : {fail}.")
 
-    elif state == "set_gofile":
-        await DB.execute("UPDATE settings SET gofile_link=$1 WHERE chat_id=$2", txt, GROUP_ID)
-        await update.message.reply_text("Lien Gofile enregistré pour la prochaine publication.")
 
     elif state == "set_reward_text":
         await DB.execute("UPDATE settings SET reward_text=$1 WHERE chat_id=$2", txt, GROUP_ID)
