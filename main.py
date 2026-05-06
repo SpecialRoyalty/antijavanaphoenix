@@ -1159,11 +1159,16 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             INSERT INTO reward_reports(campaign_id, user_id, report_type, created_at)
             VALUES($1,$2,$3,$4)
         """, campaign_id, q.from_user.id, report_type, int(time.time()))
-        await q.answer("Signalement envoyé. Merci.", show_alert=True)
+
+        label = "lien mort" if report_type == "dead" else "bug"
+        await q.message.reply_text(f"✅ Signalement envoyé : {label}\nRécompense #{campaign_id}")
+
         for admin_id in ADMIN_IDS:
             try:
-                label = "lien mort" if report_type == "dead" else "bug"
-                await context.bot.send_message(admin_id, f"⚠️ Signalement {label}\nRécompense #{campaign_id}\nUser : {q.from_user.id}")
+                await context.bot.send_message(
+                    admin_id,
+                    f"⚠️ Signalement {label}\nRécompense #{campaign_id}\nUser : {q.from_user.id}"
+                )
             except Exception:
                 pass
         return
@@ -1353,6 +1358,32 @@ async def notify_all_users_new_challenge(context: ContextTypes.DEFAULT_TYPE, cam
     return ok, fail
 
 
+async def notify_all_users_reward_updated(context: ContextTypes.DEFAULT_TYPE, campaign_id: int, what_changed: str) -> tuple[int, int]:
+    rows = await DB.fetch("SELECT DISTINCT user_id FROM bot_users WHERE started_private=TRUE")
+    ok = fail = 0
+
+    if BOT_USERNAME:
+        url = f"https://t.me/{BOT_USERNAME}?start=reward_{campaign_id}"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Voir la récompense", url=url)]])
+    else:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Voir la récompense", callback_data=f"share:{campaign_id}")]])
+
+    for r in rows:
+        try:
+            await context.bot.send_message(
+                r["user_id"],
+                f"🔔 Mise à jour récompense #{campaign_id}\\n\\n"
+                f"{what_changed}\\n\\n"
+                "Clique ici pour voir le nouveau lien / mot de passe 👇",
+                reply_markup=kb,
+            )
+            ok += 1
+        except Exception:
+            fail += 1
+
+    return ok, fail
+
+
 async def private_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await save_user(update.effective_user, started_private=True)
 
@@ -1428,7 +1459,15 @@ async def private_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             campaign_id,
             GROUP_ID,
         )
-        await update.message.reply_text(f"Lien Gofile modifié pour la récompense #{campaign_id}.")
+        ok, fail = await notify_all_users_reward_updated(
+            context,
+            campaign_id,
+            "Le lien Gofile a été mis à jour."
+        )
+        await update.message.reply_text(
+            f"Lien Gofile modifié pour la récompense #{campaign_id}.\n"
+            f"Utilisateurs prévenus en PV : {ok}. Échecs : {fail}."
+        )
         USER_STATE.pop(user_id, None)
         return
 
@@ -1440,7 +1479,15 @@ async def private_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             campaign_id,
             GROUP_ID,
         )
-        await update.message.reply_text(f"Mot de passe modifié pour la récompense #{campaign_id}.")
+        ok, fail = await notify_all_users_reward_updated(
+            context,
+            campaign_id,
+            "Le mot de passe a été mis à jour."
+        )
+        await update.message.reply_text(
+            f"Mot de passe modifié pour la récompense #{campaign_id}.\n"
+            f"Utilisateurs prévenus en PV : {ok}. Échecs : {fail}."
+        )
         USER_STATE.pop(user_id, None)
         return
 
