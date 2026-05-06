@@ -64,6 +64,7 @@ LANG_CONFIDENCE = float(os.getenv("LANG_CONFIDENCE", "0.85"))
 DB: asyncpg.Pool | None = None
 USER_STATE: dict[int, str] = {}
 CREATE_FLOW: dict[int, dict] = {}
+REPORT_FLOW: dict[int, dict] = {}
 BOT_USERNAME = ""
 
 
@@ -222,8 +223,11 @@ async def init_db():
             campaign_id BIGINT NOT NULL REFERENCES reward_campaigns(id) ON DELETE CASCADE,
             user_id BIGINT NOT NULL,
             report_type TEXT NOT NULL,
+            message TEXT DEFAULT '',
             created_at BIGINT NOT NULL
         );
+
+        ALTER TABLE reward_reports ADD COLUMN IF NOT EXISTS message TEXT DEFAULT '';
         """)
 
         await con.execute("""
@@ -1155,22 +1159,29 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data.startswith("report:"):
         _, report_type, campaign_id_s = q.data.split(":", 2)
         campaign_id = int(campaign_id_s)
-        await DB.execute("""
-            INSERT INTO reward_reports(campaign_id, user_id, report_type, created_at)
-            VALUES($1,$2,$3,$4)
-        """, campaign_id, q.from_user.id, report_type, int(time.time()))
-
         label = "lien mort" if report_type == "dead" else "bug"
+
+        if report_type == "bug":
+            REPORT_FLOW[q.from_user.id] = {"campaign_id": campaign_id, "report_type": report_type}
+            await q.message.reply_text(
+                f"🐞 Décris le bug pour la récompense #{campaign_id}.\n\n"
+                "Envoie ton message ici, je le transmettrai aux admins."
+            )
+            return
+
+        await DB.execute("""
+            INSERT INTO reward_reports(campaign_id, user_id, report_type, message, created_at)
+            VALUES($1,$2,$3,$4,$5)
+        """, campaign_id, q.from_user.id, report_type, "", int(time.time()))
+
         await q.message.reply_text(f"✅ Signalement envoyé : {label}\nRécompense #{campaign_id}")
 
-        for admin_id in ADMIN_IDS:
-            try:
-                await context.bot.send_message(
-                    admin_id,
-                    f"⚠️ Signalement {label}\nRécompense #{campaign_id}\nUser : {q.from_user.id}"
-                )
-            except Exception:
-                pass
+        await notify_admins(
+            context,
+            f"⚠️ Signalement {label}\n"
+            f"Récompense #{campaign_id}\n"
+            f"User : {q.from_user.id}"
+        )
         return
 
     if q.data.startswith("refresh:"):
@@ -1272,7 +1283,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data.startswith("reward_reports:"):
         campaign_id = int(q.data.split(":", 1)[1])
         rows = await DB.fetch("""
-            SELECT user_id, report_type, created_at
+            SELECT user_id, report_type, message, created_at
             FROM reward_reports
             WHERE campaign_id=$1
             ORDER BY created_at DESC
@@ -1284,7 +1295,8 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines = [f"🚨 Signalements récompense #{campaign_id}"]
             for r in rows:
                 label = "lien mort" if r["report_type"] == "dead" else "bug"
-                lines.append(f"- {label} — user {r['user_id']}")
+                extra = f" — {r['message']}" if r["message"] else ""
+                lines.append(f"- {label} — user {r['user_id']}{extra}")
             await q.message.reply_text("\n".join(lines))
         return
 
@@ -1330,6 +1342,34 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "1/3 — Envoie le lien Gofile visible publiquement."
         )
         return
+
+
+async def get_admin_recipients(context: ContextTypes.DEFAULT_TYPE) -> set[int]:
+    """
+    Admins à notifier :
+    - ADMIN_IDS du .env
+    - + créateur/admins du groupe que Telegram expose au bot
+    """
+    recipients = set(ADMIN_IDS)
+
+    try:
+        admins = await context.bot.get_chat_administrators(GROUP_ID)
+        for a in admins:
+            if not a.user.is_bot:
+                recipients.add(a.user.id)
+    except Exception as e:
+        log.warning("Impossible de récupérer les admins du groupe: %s", e)
+
+    return recipients
+
+
+async def notify_admins(context: ContextTypes.DEFAULT_TYPE, message: str):
+    recipients = await get_admin_recipients(context)
+    for admin_id in recipients:
+        try:
+            await context.bot.send_message(admin_id, message)
+        except Exception as e:
+            log.info("Impossible de notifier admin %s: %s", admin_id, e)
 
 
 async def notify_all_users_new_challenge(context: ContextTypes.DEFAULT_TYPE, campaign_id: int) -> tuple[int, int]:
@@ -1388,12 +1428,34 @@ async def private_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await save_user(update.effective_user, started_private=True)
 
     user_id = update.effective_user.id
+    txt = update.message.text.strip()
+
+    # Réponse utilisateur après clic "Signaler un bug".
+    if user_id in REPORT_FLOW:
+        data = REPORT_FLOW.pop(user_id)
+        campaign_id = int(data["campaign_id"])
+        report_type = data["report_type"]
+
+        await DB.execute("""
+            INSERT INTO reward_reports(campaign_id, user_id, report_type, message, created_at)
+            VALUES($1,$2,$3,$4,$5)
+        """, campaign_id, user_id, report_type, txt, int(time.time()))
+
+        await update.message.reply_text(f"✅ Bug transmis aux admins.\nRécompense #{campaign_id}")
+
+        await notify_admins(
+            context,
+            f"🐞 Signalement bug\n"
+            f"Récompense #{campaign_id}\n"
+            f"User : {user_id}\n\n"
+            f"Message :\n{txt}"
+        )
+        return
+
     state = USER_STATE.get(user_id)
 
     if not state or not await is_admin(update, context, user_id, GROUP_ID):
         return
-
-    txt = update.message.text.strip()
 
     if state == "create_reward_gofile":
         CREATE_FLOW[user_id] = {"gofile_link": txt}
