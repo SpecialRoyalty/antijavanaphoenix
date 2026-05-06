@@ -823,7 +823,7 @@ async def list_active_rewards(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         FROM reward_links rl
         JOIN reward_campaigns rc ON rc.id=rl.campaign_id
         WHERE rl.owner_id=$1 AND rl.delivered=FALSE AND rc.active=TRUE AND rc.is_free=FALSE
-        ORDER BY rl.created_at DESC
+        ORDER BY rl.created_at ASC
         LIMIT 1
     """, user_id)
     active_id = int(active["campaign_id"]) if active else None
@@ -867,7 +867,7 @@ async def open_reward_view(user_id: int, context: ContextTypes.DEFAULT_TYPE, cam
         FROM reward_links rl
         JOIN reward_campaigns rc ON rc.id=rl.campaign_id
         WHERE rl.owner_id=$1 AND rl.delivered=FALSE AND rc.active=TRUE AND rc.is_free=FALSE
-        ORDER BY rl.created_at DESC
+        ORDER BY rl.created_at ASC
         LIMIT 1
     """, user_id)
 
