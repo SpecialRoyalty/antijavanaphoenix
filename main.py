@@ -805,6 +805,29 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+async def get_first_available_paid_campaign_id(user_id: int) -> int | None:
+    """
+    Progression forcée :
+    seul le premier défi payant actif non débloqué est accessible.
+    Les récompenses gratuites restent toujours accessibles.
+    """
+    row = await DB.fetchrow("""
+        SELECT rc.id
+        FROM reward_campaigns rc
+        LEFT JOIN reward_links rl
+          ON rl.campaign_id = rc.id
+         AND rl.owner_id = $2
+        WHERE rc.chat_id = $1
+          AND rc.active = TRUE
+          AND rc.is_free = FALSE
+          AND COALESCE(rl.delivered, FALSE) = FALSE
+        ORDER BY rc.id ASC
+        LIMIT 1
+    """, GROUP_ID, user_id)
+    return int(row["id"]) if row else None
+
+
 async def list_active_rewards(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     rows = await DB.fetch("""
         SELECT id, required_joins, is_free, active
@@ -818,35 +841,36 @@ async def list_active_rewards(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(user_id, "Aucune récompense active pour le moment.")
         return
 
-    active = await DB.fetchrow("""
-        SELECT rl.campaign_id, rl.joins_count, rc.required_joins
-        FROM reward_links rl
-        JOIN reward_campaigns rc ON rc.id=rl.campaign_id
-        WHERE rl.owner_id=$1 AND rl.delivered=FALSE AND rc.active=TRUE AND rc.is_free=FALSE
-        ORDER BY rl.created_at ASC
-        LIMIT 1
-    """, user_id)
-    active_id = int(active["campaign_id"]) if active else None
+    first_available_paid_id = await get_first_available_paid_campaign_id(user_id)
 
     buttons = []
     for r in rows:
         cid = int(r["id"])
-        link = await DB.fetchrow("SELECT joins_count, delivered FROM reward_links WHERE campaign_id=$1 AND owner_id=$2", cid, user_id)
+        link = await DB.fetchrow(
+            "SELECT joins_count, delivered FROM reward_links WHERE campaign_id=$1 AND owner_id=$2",
+            cid,
+            user_id,
+        )
+
         if r["is_free"]:
             label = f"📁 Fichier #{cid} 🆓 Gratuit"
         elif link and link["delivered"]:
             label = f"📁 Fichier #{cid} ✅ Débloqué"
-        elif active_id == cid:
-            label = f"📁 Fichier #{cid} ✅ En cours {link['joins_count']}/{r['required_joins']}"
-        elif active_id and active_id != cid:
-            label = f"📁 Fichier #{cid} ❌ Bloqué"
+        elif first_available_paid_id == cid:
+            if link:
+                label = f"📁 Fichier #{cid} ✅ En cours {link['joins_count']}/{r['required_joins']}"
+            else:
+                label = f"📁 Fichier #{cid} 🔐 Disponible"
         else:
-            label = f"📁 Fichier #{cid} 🔐 Disponible"
+            label = f"📁 Fichier #{cid} ❌ Bloqué"
+
         buttons.append([InlineKeyboardButton(label, callback_data=f"reward_open:{cid}")])
 
     await context.bot.send_message(
         user_id,
-        "🎁 Récompenses disponibles :\n\n📌 Chaque récompense a son propre défi.\nTu peux voir la liste complète ici.",
+        "🎁 Récompenses disponibles :\n\n"
+        "📌 Les fichiers se débloquent dans l’ordre.\n"
+        "Les contenus gratuits restent accessibles à tout moment.",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
@@ -862,15 +886,6 @@ async def open_reward_view(user_id: int, context: ContextTypes.DEFAULT_TYPE, cam
         await context.bot.send_message(user_id, "Cette récompense n’est plus active.")
         return
 
-    active = await DB.fetchrow("""
-        SELECT rl.campaign_id
-        FROM reward_links rl
-        JOIN reward_campaigns rc ON rc.id=rl.campaign_id
-        WHERE rl.owner_id=$1 AND rl.delivered=FALSE AND rc.active=TRUE AND rc.is_free=FALSE
-        ORDER BY rl.created_at ASC
-        LIMIT 1
-    """, user_id)
-
     row = await DB.fetchrow("""
         SELECT invite_link, joins_count, delivered
         FROM reward_links
@@ -883,25 +898,42 @@ async def open_reward_view(user_id: int, context: ContextTypes.DEFAULT_TYPE, cam
         [InlineKeyboardButton("⬅️ Retour aux récompenses", callback_data="rewards_list")],
     ]
 
-    if campaign["is_free"] or (row and row["delivered"]):
-        title = "🆓 Récompense gratuite" if campaign["is_free"] else "✅ Récompense déjà débloquée"
+    if campaign["is_free"]:
         await context.bot.send_message(
             user_id,
-            f"{title}\n\n🔗 Lien : {campaign['gofile_link']}\n🔐 Mot de passe : {campaign['password'] or 'Aucun'}",
+            "🆓 Récompense gratuite\n\n"
+            f"🔗 Lien : {campaign['gofile_link']}\n"
+            f"🔐 Mot de passe : {campaign['password'] or 'Aucun'}",
             reply_markup=InlineKeyboardMarkup(report_buttons),
         )
         return
 
-    if active and int(active["campaign_id"]) != int(campaign_id):
+    if row and row["delivered"]:
         await context.bot.send_message(
             user_id,
-            "❌ Cette récompense est bloquée pour le moment.\n\nTu as déjà un défi en cours.\nTermine d’abord le fichier en cours avant d’ouvrir celui-ci.",
+            "✅ Récompense déjà débloquée\n\n"
+            f"🔗 Lien : {campaign['gofile_link']}\n"
+            f"🔐 Mot de passe : {campaign['password'] or 'Aucun'}",
+            reply_markup=InlineKeyboardMarkup(report_buttons),
+        )
+        return
+
+    first_available_paid_id = await get_first_available_paid_campaign_id(user_id)
+    if first_available_paid_id != int(campaign_id):
+        await context.bot.send_message(
+            user_id,
+            "❌ Cette récompense est bloquée pour le moment.\n\n"
+            "Les fichiers se débloquent dans l’ordre.\n"
+            "Termine d’abord le premier défi disponible avant d’ouvrir celui-ci.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour aux récompenses", callback_data="rewards_list")]]),
         )
         return
 
     if not row:
-        link = await context.bot.create_chat_invite_link(GROUP_ID, name=f"c{campaign_id}_u{user_id}"[:32])
+        link = await context.bot.create_chat_invite_link(
+            GROUP_ID,
+            name=f"c{campaign_id}_u{user_id}"[:32],
+        )
         await DB.execute("""
             INSERT INTO reward_links(campaign_id, chat_id, owner_id, invite_link, created_at)
             VALUES($1,$2,$3,$4,$5)
