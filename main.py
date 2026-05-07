@@ -946,7 +946,7 @@ async def open_reward_view(user_id: int, context: ContextTypes.DEFAULT_TYPE, cam
     else:
         invite, count = row["invite_link"], row["joins_count"]
 
-    share_text = f"Rejoins ce groupe pour m’aider à débloquer un mot de passe : {invite}"
+    share_text = f"Tu veux des vidéos gratuites ? Pas de VIP tout est gratuit : {invite}"
     share_url = f"https://t.me/share/url?url={quote_plus(invite)}&text={quote_plus(share_text)}"
     required = int(campaign["required_joins"])
 
