@@ -13,11 +13,6 @@ from datetime import datetime, timedelta, timezone
 import asyncpg
 from dotenv import load_dotenv
 
-try:
-    from langdetect import detect_langs, LangDetectException
-except Exception:
-    detect_langs = None
-    LangDetectException = Exception
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.constants import ParseMode
@@ -414,46 +409,6 @@ async def check_forbidden(chat_id: int, text: str) -> str | None:
     return None
 
 
-def should_ban_non_french(text: str) -> tuple[bool, str]:
-    """
-    Détection langue via langdetect.
-    Retourne (True, langue) si le message semble clairement non-français.
-    Sécurité anti-faux positifs :
-    - ignore les messages trop courts
-    - ignore si langdetect n'est pas installé
-    - demande une confiance suffisante
-    """
-    if not text or not detect_langs:
-        return False, ""
-
-    clean = re.sub(r"https?://\S+|www\.\S+|@\w+", " ", text)
-    letters = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]", clean)
-
-    if len(letters) < LANG_MIN_LETTERS:
-        return False, ""
-
-    # Beaucoup de français courts sont mal détectés ; les accents aident à confirmer.
-    try:
-        langs = detect_langs(clean)
-    except LangDetectException:
-        return False, ""
-
-    if not langs:
-        return False, ""
-
-    top = langs[0]
-    lang = top.lang
-    prob = float(top.prob)
-
-    if lang == "fr":
-        return False, lang
-
-    # Si le texte contient des accents français, on évite de ban sauf confiance très forte.
-    if FR_EXTRA_RE.search(clean) and prob < 0.95:
-        return False, lang
-
-    return prob >= LANG_CONFIDENCE, lang
-
 
 def is_forwarded_message(msg) -> bool:
     """
@@ -596,14 +551,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await punish_forbidden_word(context, msg.chat_id, user.id)
         return
 
-    # Langue non française détectée clairement = ban direct.
-    # Fonctionne ON ou OFF. Pas de message public.
-    ban_lang, detected_lang = should_ban_non_french(text)
-    if text and ban_lang:
-        await delete_safely(context, msg.chat_id, msg.message_id)
-        await ban_user(context, msg.chat_id, user.id)
-        log.info("Banned non-French message from %s detected=%s text=%r", user.id, detected_lang, text[:80])
-        return
+
 
     # Message texte envoyé dans les 2 minutes après arrivée/rejoin => mute 1 jour.
     # Pas de message public.
