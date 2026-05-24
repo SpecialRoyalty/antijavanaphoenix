@@ -509,30 +509,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await mute_user(context, msg.chat_id, user.id, 30)
         return
 
-    # Enregistre un fallback d'arrivée au premier message vu.
-    # Ça rend la règle média 2 minutes beaucoup plus fiable si Telegram rate le join.
-    joined_at = await get_or_create_join_time(msg.chat_id, user.id)
+    # IMPORTANT :
+    # On ne crée PAS de fallback join sur un simple message texte.
+    # Sinon, après un reset de la table joins, tous les anciens membres sont vus comme "nouveaux"
+    # et se font mute au premier message.
+    join_row = await DB.fetchrow(
+        "SELECT joined_at FROM joins WHERE chat_id=$1 AND user_id=$2",
+        msg.chat_id,
+        user.id,
+    )
+    joined_at = int(join_row["joined_at"]) if join_row and join_row["joined_at"] else None
 
     # Forward :
     # - forward normal = supprimé
     # - forward avec lien/@ = ban direct
-    # - forward dans les 2 minutes après arrivée/rejoin = ban direct
+    # - forward dans les 2 minutes après VRAI join enregistré = ban direct
     if is_forwarded_message(msg):
         await delete_safely(context, msg.chat_id, msg.message_id)
 
-        if (text and (URL_RE.search(text) or AT_RE.search(text))) or int(time.time()) - int(joined_at) <= 120:
+        if (text and (URL_RE.search(text) or AT_RE.search(text))) or (
+            joined_at and int(time.time()) - joined_at <= 120
+        ):
             await ban_user(context, msg.chat_id, user.id)
 
         return
 
     # Règle prioritaire, même si le groupe est ON ou OFF :
     # média interdit pour utilisateurs normaux.
-    # Si média envoyé dans les 2 minutes après arrivée/rejoin => ban direct.
-    # Après 2 minutes => suppression seulement.
+    # Si média envoyé dans les 2 minutes après VRAI join enregistré => ban direct.
+    # Après 2 minutes ou sans join enregistré => suppression seulement.
     if has_media(msg):
         await delete_safely(context, msg.chat_id, msg.message_id)
 
-        if int(time.time()) - int(joined_at) <= 120:
+        if joined_at and int(time.time()) - joined_at <= 120:
             await ban_user(context, msg.chat_id, user.id)
 
         return
@@ -553,9 +562,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
-    # Message texte envoyé dans les 2 minutes après arrivée/rejoin => mute 1 jour.
-    # Pas de message public.
-    if text and int(time.time()) - int(joined_at) <= 120:
+    # Message texte envoyé dans les 2 minutes après VRAI join enregistré => mute 1 jour.
+    # Si joins a été reset et que l'utilisateur était déjà dans le groupe, on ne mute pas.
+    if text and joined_at and int(time.time()) - joined_at <= 120:
         await delete_safely(context, msg.chat_id, msg.message_id)
         await mute_user(context, msg.chat_id, user.id, 1)
         return
