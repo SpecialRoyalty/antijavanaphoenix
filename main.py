@@ -6,6 +6,7 @@ import re
 import time
 import random
 import logging
+import asyncio
 import unicodedata
 from urllib.parse import quote_plus
 from datetime import datetime, timedelta, timezone
@@ -16,6 +17,7 @@ from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.constants import ParseMode
+from telegram.error import RetryAfter
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -41,6 +43,10 @@ REWARD_IMAGE_URL = os.getenv(
     "https://i.postimg.cc/XNzZGCZY/5475f4b9-b4f6-4fc1-b072-a9be4132adb4.jpg",
 )
 REWARD_REQUIRED_JOINS = int(os.getenv("REWARD_REQUIRED_JOINS", "6"))
+PRIVATE_SEND_DELAY = float(os.getenv("PRIVATE_SEND_DELAY", "1.0"))
+VIP_TOP_LIMIT_DEFAULT = int(os.getenv("VIP_TOP_LIMIT", "50"))
+VIP_WEEKLY_DAY = int(os.getenv("VIP_WEEKLY_DAY", "6"))  # 0 lundi, 6 dimanche
+VIP_WEEKLY_HOUR = int(os.getenv("VIP_WEEKLY_HOUR", "17"))
 
 DEFAULT_REWARD_TEXT = (
     "🎁 Récompense disponible !\n\n"
@@ -60,6 +66,7 @@ DB: asyncpg.Pool | None = None
 USER_STATE: dict[int, str] = {}
 CREATE_FLOW: dict[int, dict] = {}
 REPORT_FLOW: dict[int, dict] = {}
+PUBLISH_LOCK: set[int] = set()
 BOT_USERNAME = ""
 
 
@@ -90,13 +97,15 @@ def admin_panel() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("✍️ Texte pub", callback_data="set_reward_text")],
         [InlineKeyboardButton("🖼 Image pub", callback_data="set_reward_image")],
         [InlineKeyboardButton("🎛 Gérer récompenses", callback_data="manage_rewards")],
+        [InlineKeyboardButton("👑 VIP", callback_data="vip_admin")],
         [InlineKeyboardButton("🚀 Publish nouvelle récompense", callback_data="publish")],
     ])
 
 
 def user_home_panel() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎁 Voir les récompenses actives", callback_data="rewards_list")]
+        [InlineKeyboardButton("🎁 Voir les récompenses actives", callback_data="rewards_list")],
+        [InlineKeyboardButton("👑 VIP Antijavana", callback_data="vip_home")],
     ])
 
 
@@ -223,6 +232,24 @@ async def init_db():
         );
 
         ALTER TABLE reward_reports ADD COLUMN IF NOT EXISTS message TEXT DEFAULT '';
+
+        CREATE TABLE IF NOT EXISTS user_stats (
+            user_id BIGINT PRIMARY KEY,
+            total_invites INT DEFAULT 0,
+            weekly_invites INT DEFAULT 0,
+            last_vip_rank INT DEFAULT NULL,
+            vip_notified_inside BOOLEAN DEFAULT FALSE,
+            updated_at BIGINT NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS vip_settings (
+            chat_id BIGINT PRIMARY KEY,
+            vip_link TEXT DEFAULT '',
+            top_limit INT DEFAULT 50,
+            auto_post BOOLEAN DEFAULT FALSE,
+            image_url TEXT DEFAULT '',
+            promo_text TEXT DEFAULT ''
+        );
         """)
 
         await con.execute("""
@@ -230,6 +257,12 @@ async def init_db():
             VALUES($1, $2, $3)
             ON CONFLICT(chat_id) DO NOTHING
         """, GROUP_ID, REWARD_IMAGE_URL, DEFAULT_REWARD_TEXT)
+
+        await con.execute("""
+            INSERT INTO vip_settings(chat_id, top_limit, image_url, promo_text)
+            VALUES($1, $2, $3, $4)
+            ON CONFLICT(chat_id) DO NOTHING
+        """, GROUP_ID, VIP_TOP_LIMIT_DEFAULT, REWARD_IMAGE_URL, "👑 VIP Antijavana gratuit\n\nAccès réservé aux meilleurs inviteurs.")
 
         await con.execute("""
             UPDATE settings
@@ -308,6 +341,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     args = context.args or []
 
+    if args and args[0] == "vip":
+        await vip_home(update.effective_user.id, context)
+        return
+
     if args and args[0].startswith("reward_"):
         try:
             campaign_id = int(args[0].split("_", 1)[1])
@@ -339,6 +376,31 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(await get_admin_panel_text(), reply_markup=admin_panel())
+
+
+async def send_photo_safely(context, chat_id, photo, caption=None, reply_markup=None):
+    """
+    Envoie une photo en respectant le flood control Telegram.
+    Si Telegram demande d'attendre, le bot attend puis réessaie.
+    """
+    try:
+        return await context.bot.send_photo(
+            chat_id,
+            photo=photo,
+            caption=caption,
+            reply_markup=reply_markup,
+        )
+    except RetryAfter as e:
+        wait = int(getattr(e, "retry_after", 30)) + 1
+        log.warning("Flood control send_photo. Waiting %s seconds before retry.", wait)
+        import asyncio
+        await asyncio.sleep(wait)
+        return await context.bot.send_photo(
+            chat_id,
+            photo=photo,
+            caption=caption,
+            reply_markup=reply_markup,
+        )
 
 
 async def mute_user(context, chat_id: int, user_id: int, days: int):
@@ -663,6 +725,8 @@ async def validate_pending_join(context: ContextTypes.DEFAULT_TYPE):
         RETURNING joins_count
     """, campaign_id, owner_id)
 
+    await add_valid_invite(owner_id)
+
     campaign = await DB.fetchrow("""
         SELECT gofile_link, password, required_joins
         FROM reward_campaigns
@@ -968,6 +1032,193 @@ async def bot_info_text(context: ContextTypes.DEFAULT_TYPE) -> str:
 
 
 
+
+async def send_message_safely(context, chat_id: int, text: str, reply_markup=None, parse_mode=None, disable_web_page_preview=True):
+    try:
+        return await context.bot.send_message(
+            chat_id,
+            text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+        )
+    except RetryAfter as e:
+        wait = int(getattr(e, "retry_after", 30)) + 1
+        log.warning("Flood control send_message. Waiting %s seconds.", wait)
+        await asyncio.sleep(wait)
+        return await context.bot.send_message(
+            chat_id,
+            text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+        )
+
+
+async def notify_users_slowly(context, user_ids: list[int], text: str, reply_markup=None) -> tuple[int, int]:
+    ok = fail = 0
+    seen = set()
+    for uid in user_ids:
+        if uid in seen:
+            continue
+        seen.add(uid)
+        try:
+            await send_message_safely(context, uid, text, reply_markup=reply_markup)
+            ok += 1
+        except Exception as e:
+            log.info("PV notification failed for %s: %s", uid, e)
+            fail += 1
+        await asyncio.sleep(PRIVATE_SEND_DELAY)
+    return ok, fail
+
+
+async def get_user_total_invites(user_id: int) -> int:
+    row = await DB.fetchrow("SELECT total_invites FROM user_stats WHERE user_id=$1", user_id)
+    return int(row["total_invites"]) if row else 0
+
+
+async def add_valid_invite(owner_id: int):
+    now = int(time.time())
+    await DB.execute("""
+        INSERT INTO user_stats(user_id, total_invites, weekly_invites, updated_at)
+        VALUES($1, 1, 1, $2)
+        ON CONFLICT(user_id) DO UPDATE SET
+            total_invites=user_stats.total_invites+1,
+            weekly_invites=user_stats.weekly_invites+1,
+            updated_at=$2
+    """, owner_id, now)
+
+
+async def vip_rank(user_id: int) -> tuple[int | None, int, int]:
+    stats = await DB.fetch("""
+        SELECT user_id, total_invites
+        FROM user_stats
+        ORDER BY total_invites DESC, updated_at ASC, user_id ASC
+    """)
+    total = 0
+    rank = None
+    for i, r in enumerate(stats, start=1):
+        if int(r["user_id"]) == int(user_id):
+            rank = i
+            total = int(r["total_invites"] or 0)
+            break
+    top_limit = await DB.fetchval("SELECT top_limit FROM vip_settings WHERE chat_id=$1", GROUP_ID) or VIP_TOP_LIMIT_DEFAULT
+    return rank, total, int(top_limit)
+
+
+async def vip_home(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    rank, total, top_limit = await vip_rank(user_id)
+    rank_txt = f"#{rank}" if rank else "non classé"
+    if rank and rank <= top_limit:
+        vip_link = await DB.fetchval("SELECT vip_link FROM vip_settings WHERE chat_id=$1", GROUP_ID) or ""
+        msg = (
+            "👑 VIP Antijavana\\n\\n"
+            f"Ton rang : {rank_txt}\\n"
+            f"Invitations validées : {total}\\n\\n"
+            f"🎉 Tu es dans le Top {top_limit}."
+        )
+        if vip_link:
+            msg += f"\\n\\nVoici ton accès VIP :\\n{vip_link}"
+        else:
+            msg += "\\n\\nLe lien VIP n’est pas encore configuré."
+    else:
+        needed = ""
+        if rank:
+            better = await DB.fetchval("""
+                SELECT total_invites FROM user_stats
+                ORDER BY total_invites DESC, updated_at ASC, user_id ASC
+                OFFSET $1 LIMIT 1
+            """, max(top_limit - 1, 0))
+            if better is not None:
+                diff = max(int(better) - total + 1, 1)
+                needed = f"\\nEncore environ {diff} invitation(s) pour entrer dans le Top {top_limit}."
+        msg = (
+            "👑 VIP Antijavana\\n\\n"
+            f"Ton rang : {rank_txt}\\n"
+            f"Invitations validées : {total}\\n"
+            f"{needed}\\n\\n"
+            "Le VIP gratuit est réservé aux meilleurs inviteurs."
+        )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎁 Récompenses", callback_data="rewards_list")]])
+    await send_message_safely(context, user_id, msg, reply_markup=kb)
+
+
+async def vip_admin_text() -> tuple[str, InlineKeyboardMarkup]:
+    row = await DB.fetchrow("SELECT vip_link, top_limit, auto_post FROM vip_settings WHERE chat_id=$1", GROUP_ID)
+    if not row:
+        await DB.execute("""
+            INSERT INTO vip_settings(chat_id, top_limit, image_url, promo_text)
+            VALUES($1,$2,$3,$4)
+            ON CONFLICT DO NOTHING
+        """, GROUP_ID, VIP_TOP_LIMIT_DEFAULT, REWARD_IMAGE_URL, "👑 VIP Antijavana gratuit\\n\\nAccès réservé aux meilleurs inviteurs.")
+        row = await DB.fetchrow("SELECT vip_link, top_limit, auto_post FROM vip_settings WHERE chat_id=$1", GROUP_ID)
+    txt = (
+        "👑 Panel VIP\\n\\n"
+        f"Lien VIP : {row['vip_link'] or 'Non configuré'}\\n"
+        f"Top requis : {row['top_limit']}\\n"
+        f"Auto-post quotidien : {'ON ✅' if row['auto_post'] else 'OFF ❌'}"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 Lien VIP", callback_data="vip_set_link"), InlineKeyboardButton("🎯 Top requis", callback_data="vip_set_top")],
+        [InlineKeyboardButton("🖼 Image pub", callback_data="vip_set_image"), InlineKeyboardButton("✍️ Texte pub", callback_data="vip_set_text")],
+        [InlineKeyboardButton("📣 Publier VIP maintenant", callback_data="vip_publish_now")],
+        [InlineKeyboardButton("🔁 Auto ON/OFF", callback_data="vip_toggle_auto")],
+        [InlineKeyboardButton("🏆 Top inviteurs", callback_data="vip_top")],
+        [InlineKeyboardButton("⬅️ Retour", callback_data="admin_back")],
+    ])
+    return txt, kb
+
+
+async def vip_top_text(limit: int = 10, weekly: bool = False) -> str:
+    col = "weekly_invites" if weekly else "total_invites"
+    rows = await DB.fetch(f"""
+        SELECT us.user_id, us.{col} AS invites, bu.username, bu.first_name
+        FROM user_stats us
+        LEFT JOIN bot_users bu ON bu.user_id=us.user_id
+        WHERE us.{col} > 0
+        ORDER BY us.{col} DESC, us.updated_at ASC, us.user_id ASC
+        LIMIT $1
+    """, limit)
+    title = "🏆 Top inviteurs de la semaine" if weekly else "🏆 Top inviteurs"
+    if not rows:
+        return title + "\\n\\nAucun invité validé pour le moment."
+    lines = [title, ""]
+    medals = ["🥇", "🥈", "🥉"]
+    for i, r in enumerate(rows, start=1):
+        name = f"@{r['username']}" if r["username"] else (r["first_name"] or str(r["user_id"]))
+        prefix = medals[i-1] if i <= 3 else f"#{i}"
+        lines.append(f"{prefix} {name} — {r['invites']}")
+    return "\\n".join(lines)
+
+
+async def publish_vip_promo(context: ContextTypes.DEFAULT_TYPE):
+    row = await DB.fetchrow("SELECT image_url, promo_text FROM vip_settings WHERE chat_id=$1", GROUP_ID)
+    image_url = (row["image_url"] if row else "") or REWARD_IMAGE_URL
+    promo_text = (row["promo_text"] if row else "") or "👑 VIP Antijavana gratuit\\n\\nAccès réservé aux meilleurs inviteurs."
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📤 Accéder au VIP", url=f"https://t.me/{BOT_USERNAME}?start=vip" if BOT_USERNAME else "https://t.me/")]])
+    try:
+        msg = await send_photo_safely(context, GROUP_ID, photo=image_url, caption=promo_text, reply_markup=kb)
+        context.job_queue.run_once(delete_later, 3600, data={"chat_id": GROUP_ID, "message_id": msg.message_id})
+    except Exception as e:
+        log.warning("vip promo publish failed: %s", e)
+
+
+async def publish_weekly_top(context: ContextTypes.DEFAULT_TYPE):
+    text = await vip_top_text(10, weekly=True)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📤 Accéder au VIP", url=f"https://t.me/{BOT_USERNAME}?start=vip" if BOT_USERNAME else "https://t.me/")]])
+    try:
+        msg = await send_message_safely(context, GROUP_ID, text, reply_markup=kb)
+        context.job_queue.run_once(delete_later, 3600, data={"chat_id": GROUP_ID, "message_id": msg.message_id})
+    except Exception as e:
+        log.warning("weekly top publish failed: %s", e)
+
+
+async def daily_vip_auto(context: ContextTypes.DEFAULT_TYPE):
+    auto = await DB.fetchval("SELECT auto_post FROM vip_settings WHERE chat_id=$1", GROUP_ID)
+    if auto:
+        await publish_vip_promo(context)
+
+
 async def admin_rewards_list_text() -> tuple[str, InlineKeyboardMarkup]:
     rows = await DB.fetch("""
         SELECT id, active, required_joins, gofile_link
@@ -1118,6 +1369,14 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         campaign_id = int(campaign_id_s)
         label = "lien mort" if report_type == "dead" else "bug"
 
+        if await get_user_total_invites(q.from_user.id) <= 0:
+            await q.message.reply_text(
+                "Oups, tu es venu trop tard et le lien est expiré ?\n\n"
+                "Mais ton compteur d’invitations est à 0.\n"
+                "Le groupe fonctionne grâce aux partages : commence par inviter des personnes avant de signaler un lien mort ou un bug."
+            )
+            return
+
         if report_type == "bug":
             REPORT_FLOW[q.from_user.id] = {"campaign_id": campaign_id, "report_type": report_type}
             await q.message.reply_text(
@@ -1151,11 +1410,58 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Impossible de rafraîchir maintenant.", show_alert=True)
         return
 
+    if q.data == "vip_home":
+        await vip_home(q.from_user.id, context)
+        await q.answer()
+        return
+
     if not await ensure_admin(update, context):
         return
 
     if q.data == "admin_back":
         await q.edit_message_text(await get_admin_panel_text(), reply_markup=admin_panel())
+        return
+
+    if q.data == "vip_admin":
+        txt, kb = await vip_admin_text()
+        await q.message.reply_text(txt, reply_markup=kb)
+        return
+
+    if q.data == "vip_set_link":
+        USER_STATE[q.from_user.id] = "vip_set_link"
+        await q.message.reply_text("Envoie le lien du groupe VIP.")
+        return
+
+    if q.data == "vip_set_top":
+        USER_STATE[q.from_user.id] = "vip_set_top"
+        await q.message.reply_text("Envoie le nombre de places VIP. Exemple : 50")
+        return
+
+    if q.data == "vip_set_image":
+        USER_STATE[q.from_user.id] = "vip_set_image"
+        await q.message.reply_text("Envoie le lien direct de l’image de pub VIP.")
+        return
+
+    if q.data == "vip_set_text":
+        USER_STATE[q.from_user.id] = "vip_set_text"
+        await q.message.reply_text("Envoie le texte de la pub VIP.")
+        return
+
+    if q.data == "vip_toggle_auto":
+        new_val = await DB.fetchval("""
+            UPDATE vip_settings SET auto_post = NOT auto_post
+            WHERE chat_id=$1 RETURNING auto_post
+        """, GROUP_ID)
+        await q.message.reply_text(f"Auto-post VIP : {'ON' if new_val else 'OFF'}")
+        return
+
+    if q.data == "vip_publish_now":
+        await publish_vip_promo(context)
+        await q.message.reply_text("Pub VIP envoyée.")
+        return
+
+    if q.data == "vip_top":
+        await q.message.reply_text(await vip_top_text(20, weekly=False))
         return
 
     if q.data == "manage_rewards":
@@ -1214,7 +1520,8 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await DB.execute("UPDATE reward_campaigns SET active=TRUE WHERE id=$1 AND chat_id=$2", campaign_id, GROUP_ID)
 
         image_url = r["image_url"] or REWARD_IMAGE_URL
-        await context.bot.send_photo(
+        await send_photo_safely(
+            context,
             GROUP_ID,
             photo=image_url,
             caption=r["promo_text"],
@@ -1292,6 +1599,10 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(await bot_info_text(context))
 
     elif q.data == "publish":
+        if q.from_user.id in PUBLISH_LOCK:
+            await q.message.reply_text("Une création de récompense est déjà en cours. Termine-la avant d’en lancer une autre.")
+            return
+        PUBLISH_LOCK.add(q.from_user.id)
         CREATE_FLOW[q.from_user.id] = {}
         USER_STATE[q.from_user.id] = "create_reward_gofile"
         await q.message.reply_text(
@@ -1331,7 +1642,7 @@ async def notify_admins(context: ContextTypes.DEFAULT_TYPE, message: str):
 
 async def notify_all_users_new_challenge(context: ContextTypes.DEFAULT_TYPE, campaign_id: int) -> tuple[int, int]:
     rows = await DB.fetch("SELECT DISTINCT user_id FROM bot_users WHERE started_private=TRUE")
-    ok = fail = 0
+    user_ids = [int(r["user_id"]) for r in rows]
     if BOT_USERNAME:
         url = f"https://t.me/{BOT_USERNAME}?start=reward_{campaign_id}"
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Voir le nouveau contenu", url=url)]])
@@ -1345,40 +1656,24 @@ async def notify_all_users_new_challenge(context: ContextTypes.DEFAULT_TYPE, cam
         if is_free else
         "🔥 Nouveau challenge disponible !\n\nUn nouveau contenu vient d’être publié.\nClique pour voir le lien et débloquer le mot de passe 👇"
     )
-
-    for r in rows:
-        try:
-            await context.bot.send_message(r["user_id"], msg, reply_markup=kb)
-            ok += 1
-        except Exception:
-            fail += 1
-    return ok, fail
+    return await notify_users_slowly(context, user_ids, msg, reply_markup=kb)
 
 
 async def notify_all_users_reward_updated(context: ContextTypes.DEFAULT_TYPE, campaign_id: int, what_changed: str) -> tuple[int, int]:
     rows = await DB.fetch("SELECT DISTINCT user_id FROM bot_users WHERE started_private=TRUE")
-    ok = fail = 0
-
+    user_ids = [int(r["user_id"]) for r in rows]
     if BOT_USERNAME:
         url = f"https://t.me/{BOT_USERNAME}?start=reward_{campaign_id}"
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Voir la récompense", url=url)]])
     else:
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Voir la récompense", callback_data=f"share:{campaign_id}")]])
 
-    for r in rows:
-        try:
-            await context.bot.send_message(
-                r["user_id"],
-                f"🔔 Mise à jour récompense #{campaign_id}\\n\\n"
-                f"{what_changed}\\n\\n"
-                "Clique ici pour voir le nouveau lien / mot de passe 👇",
-                reply_markup=kb,
-            )
-            ok += 1
-        except Exception:
-            fail += 1
-
-    return ok, fail
+    msg = (
+        f"🔔 Mise à jour récompense #{campaign_id}\n\n"
+        f"{what_changed}\n\n"
+        "Clique ici pour voir le nouveau lien / mot de passe 👇"
+    )
+    return await notify_users_slowly(context, user_ids, msg, reply_markup=kb)
 
 
 async def private_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1414,6 +1709,35 @@ async def private_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not state or not await is_admin(update, context, user_id, GROUP_ID):
         return
 
+    if state == "vip_set_link":
+        await DB.execute("UPDATE vip_settings SET vip_link=$1 WHERE chat_id=$2", txt, GROUP_ID)
+        await update.message.reply_text("Lien VIP enregistré.")
+        USER_STATE.pop(user_id, None)
+        return
+
+    if state == "vip_set_top":
+        try:
+            top = max(1, int(txt))
+        except ValueError:
+            await update.message.reply_text("Envoie un nombre valide.")
+            return
+        await DB.execute("UPDATE vip_settings SET top_limit=$1 WHERE chat_id=$2", top, GROUP_ID)
+        await update.message.reply_text(f"Top VIP configuré : {top}")
+        USER_STATE.pop(user_id, None)
+        return
+
+    if state == "vip_set_image":
+        await DB.execute("UPDATE vip_settings SET image_url=$1 WHERE chat_id=$2", txt, GROUP_ID)
+        await update.message.reply_text("Image VIP enregistrée.")
+        USER_STATE.pop(user_id, None)
+        return
+
+    if state == "vip_set_text":
+        await DB.execute("UPDATE vip_settings SET promo_text=$1 WHERE chat_id=$2", txt, GROUP_ID)
+        await update.message.reply_text("Texte VIP enregistré.")
+        USER_STATE.pop(user_id, None)
+        return
+
     if state == "create_reward_gofile":
         CREATE_FLOW[user_id] = {"gofile_link": txt}
         USER_STATE[user_id] = "create_reward_password"
@@ -1437,6 +1761,7 @@ async def private_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if not flow.get("gofile_link"):
             USER_STATE.pop(user_id, None)
             CREATE_FLOW.pop(user_id, None)
+            PUBLISH_LOCK.discard(user_id)
             await update.message.reply_text("Création annulée : lien Gofile manquant.")
             return
 
@@ -1451,7 +1776,8 @@ async def private_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             RETURNING id
         """, GROUP_ID, flow["gofile_link"], flow.get("password", ""), is_free, image_url, promo_text, required or REWARD_REQUIRED_JOINS, int(time.time()))
 
-        await context.bot.send_photo(
+        await send_photo_safely(
+            context,
             GROUP_ID,
             photo=image_url,
             caption=promo_text,
@@ -1462,6 +1788,7 @@ async def private_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         USER_STATE.pop(user_id, None)
         CREATE_FLOW.pop(user_id, None)
+        PUBLISH_LOCK.discard(user_id)
 
         await update.message.reply_text(
             f"Récompense #{campaign_id} créée et publiée.\n"
@@ -1626,6 +1953,19 @@ async def post_init(app: Application):
         deterrence,
         interval=7200,
         first=random.randint(120, 900),
+    )
+
+    # Pub VIP automatique quotidienne vers l'heure configurée.
+    app.job_queue.run_daily(
+        daily_vip_auto,
+        time=datetime.now().replace(hour=VIP_WEEKLY_HOUR, minute=0, second=0, microsecond=0).time(),
+    )
+
+    # Classement hebdomadaire supprimé après 1h.
+    app.job_queue.run_daily(
+        publish_weekly_top,
+        time=datetime.now().replace(hour=VIP_WEEKLY_HOUR, minute=5, second=0, microsecond=0).time(),
+        days=(VIP_WEEKLY_DAY,),
     )
 
     log.info("Bot ready as @%s", BOT_USERNAME)
