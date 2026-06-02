@@ -1112,15 +1112,15 @@ async def vip_home(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     if rank and rank <= top_limit:
         vip_link = await DB.fetchval("SELECT vip_link FROM vip_settings WHERE chat_id=$1", GROUP_ID) or ""
         msg = (
-            "👑 VIP Antijavana\\n\\n"
-            f"Ton rang : {rank_txt}\\n"
-            f"Invitations validées : {total}\\n\\n"
+            "👑 VIP Antijavana\n\n"
+            f"Ton rang : {rank_txt}\n"
+            f"Invitations validées : {total}\n\n"
             f"🎉 Tu es dans le Top {top_limit}."
         )
         if vip_link:
-            msg += f"\\n\\nVoici ton accès VIP :\\n{vip_link}"
+            msg += f"\n\nVoici ton accès VIP :\n{vip_link}"
         else:
-            msg += "\\n\\nLe lien VIP n’est pas encore configuré."
+            msg += "\n\nLe lien VIP n’est pas encore configuré."
     else:
         needed = ""
         if rank:
@@ -1131,12 +1131,12 @@ async def vip_home(user_id: int, context: ContextTypes.DEFAULT_TYPE):
             """, max(top_limit - 1, 0))
             if better is not None:
                 diff = max(int(better) - total + 1, 1)
-                needed = f"\\nEncore environ {diff} invitation(s) pour entrer dans le Top {top_limit}."
+                needed = f"\nEncore environ {diff} invitation(s) pour entrer dans le Top {top_limit}."
         msg = (
-            "👑 VIP Antijavana\\n\\n"
-            f"Ton rang : {rank_txt}\\n"
-            f"Invitations validées : {total}\\n"
-            f"{needed}\\n\\n"
+            "👑 VIP Antijavana\n\n"
+            f"Ton rang : {rank_txt}\n"
+            f"Invitations validées : {total}\n"
+            f"{needed}\n\n"
             "Le VIP gratuit est réservé aux meilleurs inviteurs."
         )
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎁 Récompenses", callback_data="rewards_list")]])
@@ -1153,9 +1153,9 @@ async def vip_admin_text() -> tuple[str, InlineKeyboardMarkup]:
         """, GROUP_ID, VIP_TOP_LIMIT_DEFAULT, REWARD_IMAGE_URL, "👑 VIP Antijavana gratuit\\n\\nAccès réservé aux meilleurs inviteurs.")
         row = await DB.fetchrow("SELECT vip_link, top_limit, auto_post FROM vip_settings WHERE chat_id=$1", GROUP_ID)
     txt = (
-        "👑 Panel VIP\\n\\n"
-        f"Lien VIP : {row['vip_link'] or 'Non configuré'}\\n"
-        f"Top requis : {row['top_limit']}\\n"
+        "👑 Panel VIP\n\n"
+        f"Lien VIP : {row['vip_link'] or 'Non configuré'}\n"
+        f"Top requis : {row['top_limit']}\n"
         f"Auto-post quotidien : {'ON ✅' if row['auto_post'] else 'OFF ❌'}"
     )
     kb = InlineKeyboardMarkup([
@@ -1181,20 +1181,20 @@ async def vip_top_text(limit: int = 10, weekly: bool = False) -> str:
     """, limit)
     title = "🏆 Top inviteurs de la semaine" if weekly else "🏆 Top inviteurs"
     if not rows:
-        return title + "\\n\\nAucun invité validé pour le moment."
+        return title + "\n\\nAucun invité validé pour le moment."
     lines = [title, ""]
     medals = ["🥇", "🥈", "🥉"]
     for i, r in enumerate(rows, start=1):
         name = f"@{r['username']}" if r["username"] else (r["first_name"] or str(r["user_id"]))
         prefix = medals[i-1] if i <= 3 else f"#{i}"
         lines.append(f"{prefix} {name} — {r['invites']}")
-    return "\\n".join(lines)
+    return "\n".join(lines)
 
 
 async def publish_vip_promo(context: ContextTypes.DEFAULT_TYPE):
     row = await DB.fetchrow("SELECT image_url, promo_text FROM vip_settings WHERE chat_id=$1", GROUP_ID)
     image_url = (row["image_url"] if row else "") or REWARD_IMAGE_URL
-    promo_text = (row["promo_text"] if row else "") or "👑 VIP Antijavana gratuit\\n\\nAccès réservé aux meilleurs inviteurs."
+    promo_text = (row["promo_text"] if row else "") or "👑 VIP Antijavana gratuit\n\nAccès réservé aux meilleurs inviteurs."
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📤 Accéder au VIP", url=f"https://t.me/{BOT_USERNAME}?start=vip" if BOT_USERNAME else "https://t.me/")]])
     try:
         msg = await send_photo_safely(context, GROUP_ID, photo=image_url, caption=promo_text, reply_markup=kb)
